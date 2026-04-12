@@ -171,8 +171,13 @@ default
                 setMode(MODE_IDLE);
                 return;
             }
-            // Stand slightly behind the owner
-            vector dir    = llVecNorm(llGetPos() - ownerPos);
+            // Stand slightly behind the owner; guard against zero-length vector
+            vector diff = llGetPos() - ownerPos;
+            vector dir;
+            if (llVecMag(diff) > 0.001)
+                dir = llVecNorm(diff);
+            else
+                dir = <1.0, 0.0, 0.0>;   // arbitrary fallback direction
             vector target = ownerPos + dir * FOLLOW_DIST;
             target.z      = ownerPos.z;
             applyMove(target);

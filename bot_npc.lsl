@@ -32,6 +32,14 @@ vector randomNearby(vector centre, float radius)
 
 spawnCharacter()
 {
+    // Guard: warn the user if the Experience key has not been configured
+    if (EXPERIENCE_KEY == "00000000-0000-0000-0000-000000000000")
+    {
+        llOwnerSay("ERROR: EXPERIENCE_KEY is still the default placeholder. "
+                 + "Set it to your Experience UUID before using NPC bots.");
+        return;
+    }
+
     // Create a pathfinding character on this prim
     llCreateCharacter([
         CHARACTER_RADIUS,        CHAR_RADIUS,

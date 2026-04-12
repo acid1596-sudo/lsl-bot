@@ -17,7 +17,8 @@ float   BOT_ALTITUDE    = 0.0;      // extra altitude offset when rezzing
 float   BOT_SPREAD      = 2.0;      // metres between each rezzed bot
 string  BOT_INVENTORY   = "Bot";    // name of the bot object in inventory
 
-// ---- communication channel (same in bot_controller.lsl) ---------------
+// ---- communication channel (same in bot_loader.lsl, bot_controller.lsl,
+//      and bot_npc.lsl – update ALL files if you change this value) ------
 integer CONTROL_CHANNEL = -987654;
 
 // ---- internal state ---------------------------------------------------

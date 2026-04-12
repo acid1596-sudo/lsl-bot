@@ -1,0 +1,35 @@
+# AvatarConfig Notecard
+#
+# This notecard is read by the Avatar Loader script (avatar_loader.lsl).
+# Place it inside the same prim as the loader script and name it exactly:
+#   AvatarConfig
+#
+# FORMAT
+# ------
+# Lines starting with '#' are comments and are ignored.
+# Blank lines are ignored.
+# Each avatar entry is one line with the format:
+#
+#   <ObjectName> | <x_offset>,<y_offset>,<z_offset>
+#
+# <ObjectName>   - the exact name of the avatar object in the prim's inventory
+# <x,y,z offset> - position offset (in metres) from the loader prim when rezzed
+#                  Positive X = East, Positive Y = North, Positive Z = Up
+#                  Default is 0,0,0 (rez on top of the loader prim).
+#
+# Up to 12 avatars may be listed (limit imposed by the dialog button count).
+#
+# EXAMPLES
+# --------
+
+# A greeter avatar rezzed 2 m north and 0.5 m east of the loader
+Greeter Bot | 0.5,2.0,0.0
+
+# A security guard rezzed 5 m to the east
+Guard Bot | 5.0,0.0,0.0
+
+# A merchant avatar rezzed at the loader's exact position
+Merchant Bot | 0.0,0.0,0.0
+
+# A tour guide placed 3 m north
+Tour Guide Bot | 0.0,3.0,0.0

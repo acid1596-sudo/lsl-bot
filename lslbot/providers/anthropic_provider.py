@@ -11,8 +11,9 @@ class AnthropicProvider(Provider):
     """Talks to Claude via the official Anthropic API."""
 
     name = "anthropic"
+    DEFAULT_MODEL = "claude-opus-5-5"
 
-    def __init__(self, api_key: str, model: str = "claude-3-5-sonnet-latest", max_tokens: int = 1024):
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL, max_tokens: int = 1024):
         if not api_key:
             raise ProviderError("ANTHROPIC_API_KEY is not set")
         self.model = model
@@ -21,13 +22,11 @@ class AnthropicProvider(Provider):
 
     def generate(self, messages: List[Message]) -> str:
         system, turns = _split_system_prompt(messages)
+        request = {"model": self.model, "max_tokens": self.max_tokens, "messages": turns}
+        if system:
+            request["system"] = system
         try:
-            response = self._client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=system,
-                messages=turns,
-            )
+            response = self._client.messages.create(**request)
         except anthropic.RateLimitError as exc:
             retry_after = parse_retry_after(getattr(exc.response, "headers", None))
             raise UsageExhaustedError(str(exc), retry_after=retry_after) from exc
@@ -36,10 +35,7 @@ class AnthropicProvider(Provider):
         except anthropic.AnthropicError as exc:
             raise ProviderError(f"Anthropic request failed: {exc}") from exc
 
-        for block in response.content:
-            if block.type == "text":
-                return block.text
-        return ""
+        return "".join(block.text for block in response.content if block.type == "text")
 
 
 def _split_system_prompt(messages: List[Message]):

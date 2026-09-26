@@ -11,8 +11,9 @@ class OpenAIProvider(Provider):
     """Talks to ChatGPT via the official OpenAI API."""
 
     name = "openai"
+    DEFAULT_MODEL = "gpt-4o-mini"
 
-    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
         if not api_key:
             raise ProviderError("OPENAI_API_KEY is not set")
         self.model = model

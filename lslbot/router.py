@@ -74,54 +74,53 @@ class FailoverRouter:
         self._load_state()
 
     def generate(self, messages: List[Message]) -> RouterResult:
-        with self._lock:
-            now = self._clock()
-            attempts: List[str] = []
+        # The lock guards provider state only; it is never held across a
+        # provider call, so one slow reply can't stall every other request.
+        attempts: List[str] = []
 
-            for provider in self._primary_providers:
-                state = self._state.get(provider.name, ProviderState())
-                if state.unavailable_until > now:
-                    attempts.append(
-                        f"{provider.name}: cooling down ({state.unavailable_until - now:.0f}s left)"
-                    )
-                    continue
-
-                try:
-                    text = provider.generate(messages)
-                except UsageExhaustedError as exc:
-                    self._on_exhausted(provider.name, exc.retry_after)
-                    attempts.append(f"{provider.name}: usage exhausted - {exc}")
-                    continue
-                except ProviderError as exc:
-                    attempts.append(f"{provider.name}: error - {exc}")
-                    continue
-
-                self._on_success(provider.name)
-                return RouterResult(text=text, provider=provider.name, handover=False, attempts=attempts)
+        for provider in self._primary_providers:
+            with self._lock:
+                remaining = self._cooldown_remaining(provider.name)
+            if remaining > 0:
+                attempts.append(f"{provider.name}: cooling down ({remaining:.0f}s left)")
+                continue
 
             try:
-                text = self._fallback.generate(messages)
+                text = provider.generate(messages)
+            except UsageExhaustedError as exc:
+                with self._lock:
+                    self._on_exhausted(provider.name, exc.retry_after)
+                attempts.append(f"{provider.name}: usage exhausted - {exc}")
+                continue
             except ProviderError as exc:
-                attempts.append(f"{self._fallback.name}: error - {exc}")
-                raise RouterError(
-                    "every primary provider is unavailable and the fallback failed: "
-                    + "; ".join(attempts)
-                ) from exc
+                attempts.append(f"{provider.name}: error - {exc}")
+                continue
 
-            attempts.append(f"{self._fallback.name}: ok")
-            return RouterResult(text=text, provider=self._fallback.name, handover=True, attempts=attempts)
+            with self._lock:
+                self._on_success(provider.name)
+            return RouterResult(text=text, provider=provider.name, handover=False, attempts=attempts)
+
+        try:
+            text = self._fallback.generate(messages)
+        except ProviderError as exc:
+            attempts.append(f"{self._fallback.name}: error - {exc}")
+            raise RouterError(
+                "every primary provider is unavailable and the fallback failed: "
+                + "; ".join(attempts)
+            ) from exc
+
+        attempts.append(f"{self._fallback.name}: ok")
+        return RouterResult(text=text, provider=self._fallback.name, handover=True, attempts=attempts)
 
     def status(self) -> dict:
         with self._lock:
-            now = self._clock()
             providers = {}
             for provider in self._primary_providers:
-                state = self._state.get(provider.name, ProviderState())
-                available = state.unavailable_until <= now
+                remaining = self._cooldown_remaining(provider.name)
                 providers[provider.name] = {
                     "role": "primary",
-                    "available": available,
-                    "retry_in_seconds": None if available else round(state.unavailable_until - now, 1),
+                    "available": remaining <= 0,
+                    "retry_in_seconds": round(remaining, 1) if remaining > 0 else None,
                 }
             providers[self._fallback.name] = {"role": "fallback", "available": True, "retry_in_seconds": None}
 
@@ -131,25 +130,39 @@ class FailoverRouter:
             )
             return {"active_provider": active, "providers": providers}
 
+    def _cooldown_remaining(self, name: str) -> float:
+        state = self._state.get(name)
+        return state.unavailable_until - self._clock() if state else 0.0
+
     def _on_exhausted(self, name: str, retry_after: Optional[float]) -> None:
+        now = self._clock()
         state = self._state.setdefault(name, ProviderState())
         if retry_after is not None:
-            delay = max(retry_after, 0.0)
+            delay = retry_after
+        elif state.unavailable_until > now:
+            # Another in-flight request already started this cooldown; a burst
+            # of simultaneous 429s is one exhaustion, not one per request.
+            return
         else:
-            base = state.backoff if state.backoff > 0 else self.default_cooldown
-            delay = min(base * self.backoff_multiplier, self.max_cooldown) if state.backoff > 0 else base
+            delay = min(state.backoff * self.backoff_multiplier, self.max_cooldown) if state.backoff > 0 else self.default_cooldown
             state.backoff = delay
-        state.unavailable_until = self._clock() + delay
-        logger.warning(
-            "provider %r out of usage, handing its tasks to %r for %.0fs",
-            name, self._fallback.name, delay,
-        )
+
+        if now + delay <= state.unavailable_until:
+            return
+        was_available = state.unavailable_until <= now
+        state.unavailable_until = now + delay
+        if was_available:
+            logger.warning(
+                "provider %r out of usage, handing its tasks to %r for %.0fs",
+                name, self._fallback.name, delay,
+            )
         self._save_state()
 
     def _on_success(self, name: str) -> None:
         state = self._state.get(name)
-        if state is not None and (state.unavailable_until > 0 or state.backoff > 0):
-            logger.info("provider %r usage reset, handing its tasks back", name)
+        if state is None or (state.unavailable_until == 0 and state.backoff == 0):
+            return
+        logger.info("provider %r usage reset, handing its tasks back", name)
         self._state[name] = ProviderState()
         self._save_state()
 

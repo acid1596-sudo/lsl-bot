@@ -5,16 +5,35 @@ import pytest
 from lslbot.router import RouterError, RouterResult
 
 
-@pytest.fixture
-def app_module(monkeypatch, tmp_path):
+def _import_server(monkeypatch, tmp_path, shared_secret=None):
+    # Run from an empty directory so a developer's real .env can't leak in.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("PRIMARY_PROVIDERS", "openai")
     monkeypatch.setenv("STATE_FILE", str(tmp_path / "state.json"))
+    if shared_secret is None:
+        monkeypatch.delenv("BOT_SHARED_SECRET", raising=False)
+    else:
+        monkeypatch.setenv("BOT_SHARED_SECRET", shared_secret)
 
     sys.modules.pop("lslbot.server", None)
     sys.modules.pop("lslbot.config", None)
     import lslbot.server as server
 
+    return server
+
+
+@pytest.fixture
+def app_module(monkeypatch, tmp_path):
+    return _import_server(monkeypatch, tmp_path)
+
+
+@pytest.fixture
+def secured_app_module(monkeypatch, tmp_path):
+    server = _import_server(monkeypatch, tmp_path, shared_secret="s3cret")
+    server.router = StubRouter(
+        result=RouterResult(text="reply", provider="openai", handover=False, attempts=[])
+    )
     return server
 
 
@@ -90,3 +109,33 @@ def test_health_endpoint(app_module):
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True}
+
+
+def test_chat_rejects_missing_secret_when_one_is_configured(secured_app_module):
+    client = secured_app_module.app.test_client()
+    resp = client.post("/chat", json={"message": "hi"})
+    assert resp.status_code == 401
+
+
+def test_chat_rejects_wrong_secret(secured_app_module):
+    client = secured_app_module.app.test_client()
+    resp = client.post("/chat", json={"message": "hi"}, headers={"X-Bot-Secret": "guess"})
+    assert resp.status_code == 401
+
+
+def test_chat_accepts_correct_secret(secured_app_module):
+    client = secured_app_module.app.test_client()
+    resp = client.post("/chat", json={"message": "hi"}, headers={"X-Bot-Secret": "s3cret"})
+    assert resp.status_code == 200
+    assert resp.get_json()["reply"] == "reply"
+
+
+def test_status_requires_secret_too(secured_app_module):
+    client = secured_app_module.app.test_client()
+    assert client.get("/status").status_code == 401
+    assert client.get("/status", headers={"X-Bot-Secret": "s3cret"}).status_code == 200
+
+
+def test_health_stays_open_for_liveness_checks(secured_app_module):
+    client = secured_app_module.app.test_client()
+    assert client.get("/health").status_code == 200

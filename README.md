@@ -84,7 +84,17 @@ All configuration is via environment variables (or `.env` - see
 | `MAX_COOLDOWN_SECONDS` | Cap on the exponential backoff. |
 | `BACKOFF_MULTIPLIER` | Growth factor applied to the cooldown each time a provider is still exhausted after its previous cooldown expired. |
 | `STATE_FILE` | Where cooldown state is persisted between restarts. Empty = memory-only. |
-| `HOST`, `PORT` | Server bind address. |
+| `HOST`, `PORT` | Server bind address. Defaults to `127.0.0.1` (this machine only). |
+| `BOT_SHARED_SECRET` | When set, `/chat` and `/status` require a matching `X-Bot-Secret` header. |
+| `LOG_LEVEL` | Python log level, default `INFO`. Failover and hand-back events are logged at `WARNING`/`INFO`. |
+
+### Exposing it to Second Life
+
+Second Life's servers have to reach this over the internet, so you'll need
+`HOST=0.0.0.0` (or a reverse proxy/tunnel in front of it). Before you do that,
+**set `BOT_SHARED_SECRET`** - otherwise anyone who finds the URL can spend
+your OpenAI/Anthropic usage through it. The secret travels in a request
+header, so put the server behind HTTPS if you can.
 
 ## API
 
@@ -97,7 +107,9 @@ All configuration is via environment variables (or `.env` - see
 ```
 `provider` says who actually answered; `handover` is `true` whenever the
 answer came from the Ollama fallback instead of a primary provider. Returns
-`503` if every provider (including Ollama) failed.
+`503` if every provider (including Ollama) failed - the details go to the
+server log rather than the response - and `401` if `BOT_SHARED_SECRET` is set
+and the `X-Bot-Secret` header doesn't match.
 
 **`GET /status`** - which provider is currently active, and for each primary
 provider whether it's available or how many seconds until its cooldown ends.
@@ -111,21 +123,36 @@ can only reach the outside world over HTTP, via `llHTTPRequest`. A minimal
 example:
 
 ```lsl
+string BOT_URL    = "https://YOUR_SERVER/chat";
+string BOT_SECRET = "the same value as BOT_SHARED_SECRET";
+
 default
 {
     touch_start(integer n)
     {
-        llHTTPRequest("http://YOUR_SERVER:8080/chat",
-            [HTTP_METHOD, "POST", HTTP_MIMETYPE, "application/json"],
+        llHTTPRequest(BOT_URL,
+            [HTTP_METHOD, "POST",
+             HTTP_MIMETYPE, "application/json",
+             HTTP_CUSTOM_HEADER, "X-Bot-Secret", BOT_SECRET,
+             HTTP_BODY_MAXLENGTH, 16384],
             llList2Json(JSON_OBJECT, ["message", "Hello!"]));
     }
 
     http_response(key id, integer status, list meta, string body)
     {
-        llSay(0, llJsonGetValue(body, ["reply"]));
+        if (status == 200)
+            llSay(0, llJsonGetValue(body, ["reply"]));
+        else
+            llOwnerSay("bot error " + (string)status);
     }
 }
 ```
+
+`HTTP_BODY_MAXLENGTH` matters: LSL truncates responses at 2048 bytes by
+default, which cuts a longer reply's JSON in half so `llJsonGetValue` can't
+parse it (16384 is the maximum for Mono scripts). Anyone who can open the
+script can read `BOT_SECRET`, so if you give the object away, make the script
+no-modify for the next owner.
 
 ## Testing
 
@@ -136,6 +163,8 @@ pytest
 
 `tests/test_router.py` covers the failover/hand-back/backoff/persistence
 logic with scripted fake providers and a fake clock (no real network or
-sleeping involved). `tests/test_providers.py` checks that real
+sleeping involved), plus concurrency: a slow provider call must not hold up
+other requests, and a burst of simultaneous 429s must start one cooldown, not
+escalate it once per request. `tests/test_providers.py` checks that real
 OpenAI/Anthropic SDK exceptions get translated correctly. `tests/test_server.py`
-covers the HTTP routes with a stubbed router.
+covers the HTTP routes and the shared-secret check with a stubbed router.

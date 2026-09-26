@@ -1,31 +1,24 @@
 import os
 from typing import List
 
-from dotenv import load_dotenv
-
 from .providers import AnthropicProvider, OllamaProvider, OpenAIProvider, Provider
 from .router import FailoverRouter
 
 _PRIMARY_PROVIDER_FACTORIES = {
     "openai": lambda: OpenAIProvider(
         api_key=os.environ.get("OPENAI_API_KEY", ""),
-        model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        model=os.environ.get("OPENAI_MODEL") or OpenAIProvider.DEFAULT_MODEL,
     ),
     "anthropic": lambda: AnthropicProvider(
         api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
-        model=os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
-        max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", "1024")),
+        model=os.environ.get("ANTHROPIC_MODEL") or AnthropicProvider.DEFAULT_MODEL,
+        max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS") or 1024),
     ),
 }
 
 
-def build_router_from_env(env_file: str = ".env") -> FailoverRouter:
-    """Build a FailoverRouter from environment variables (see .env.example),
-    loading them from ``env_file`` first if it exists. Real environment
-    variables already set always win over the file.
-    """
-    load_dotenv(env_file, override=False)
-
+def build_router_from_env() -> FailoverRouter:
+    """Build a FailoverRouter from environment variables (see .env.example)."""
     names = [n.strip() for n in os.environ.get("PRIMARY_PROVIDERS", "openai,anthropic").split(",") if n.strip()]
     if not names:
         raise ValueError("PRIMARY_PROVIDERS must list at least one provider")

@@ -26,8 +26,8 @@ class OllamaProvider(Provider):
                 timeout=self.timeout,
             )
             response.raise_for_status()
+            data = response.json()
         except requests.RequestException as exc:
             raise ProviderError(f"Ollama request failed: {exc}") from exc
 
-        data = response.json()
         return data.get("message", {}).get("content", "")

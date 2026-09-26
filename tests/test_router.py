@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from lslbot.providers.base import Provider, ProviderError, UsageExhaustedError
@@ -215,3 +217,117 @@ def test_state_persists_across_router_restarts(tmp_path):
 
     status = restarted_router.status()
     assert status["providers"]["openai"]["retry_in_seconds"] == pytest.approx(120.0)
+
+
+def test_successful_calls_do_not_rewrite_the_state_file(tmp_path):
+    state_path = tmp_path / "state.json"
+    router = make_router(
+        [FakeProvider("openai", ["a", "b"])], FakeProvider("ollama", []), FakeClock(),
+        state_path=str(state_path),
+    )
+    router.generate([])
+    router.generate([])
+    assert not state_path.exists()
+
+
+def test_slow_provider_call_does_not_block_other_requests():
+    clock = FakeClock()
+    first_call_entered = threading.Event()
+    release_first_call = threading.Event()
+
+    class SlowFirstCallProvider(Provider):
+        name = "openai"
+
+        def __init__(self):
+            self._calls = 0
+            self._calls_lock = threading.Lock()
+
+        def generate(self, messages):
+            with self._calls_lock:
+                self._calls += 1
+                call_number = self._calls
+            if call_number == 1:
+                first_call_entered.set()
+                release_first_call.wait(timeout=5)
+                return "slow reply"
+            return "fast reply"
+
+    router = make_router([SlowFirstCallProvider()], FakeProvider("ollama", []), clock)
+
+    first = threading.Thread(target=router.generate, args=([],))
+    first.start()
+    assert first_call_entered.wait(timeout=5)
+
+    second_result = {}
+    second = threading.Thread(target=lambda: second_result.setdefault("r", router.generate([])))
+    second.start()
+    second.join(timeout=2)
+    second_was_blocked = second.is_alive()
+
+    release_first_call.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not second_was_blocked, "a request waited behind another request's in-flight provider call"
+    assert second_result["r"].text == "fast reply"
+
+
+def test_simultaneous_usage_errors_start_only_one_cooldown():
+    clock = FakeClock()
+    both_in_flight = threading.Barrier(2, timeout=5)
+
+    class BurstProvider(Provider):
+        name = "openai"
+
+        def generate(self, messages):
+            both_in_flight.wait()
+            raise UsageExhaustedError("quota exceeded")
+
+    router = make_router(
+        [BurstProvider()], FakeProvider("ollama", ["a", "b"]), clock,
+        default_cooldown=10.0, backoff_multiplier=2.0,
+    )
+
+    threads = [threading.Thread(target=router.generate, args=([],)) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    # Two requests hitting the same exhaustion at once is one event: the
+    # default cooldown, not an escalated 10s * 2.
+    assert router.status()["providers"]["openai"]["retry_in_seconds"] == pytest.approx(10.0)
+
+
+class TickingClock(FakeClock):
+    """Moves forward a little on every read, like real time does between two
+    requests that arrive 'at the same moment'."""
+
+    def __call__(self):
+        self.t += 0.01
+        return self.t
+
+
+def test_simultaneous_usage_errors_log_one_handover(caplog):
+    clock = TickingClock()
+    both_in_flight = threading.Barrier(2, timeout=5)
+
+    class BurstProvider(Provider):
+        name = "openai"
+
+        def generate(self, messages):
+            both_in_flight.wait()
+            raise UsageExhaustedError("rate limited", retry_after=30.0)
+
+    router = make_router([BurstProvider()], FakeProvider("ollama", ["a", "b"]), clock)
+
+    with caplog.at_level("WARNING", logger="lslbot.router"):
+        threads = [threading.Thread(target=router.generate, args=([],)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+    handovers = [r for r in caplog.records if "out of usage" in r.getMessage()]
+    assert len(handovers) == 1
+    assert router.status()["providers"]["openai"]["retry_in_seconds"] == pytest.approx(30.0)

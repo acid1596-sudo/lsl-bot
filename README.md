@@ -48,7 +48,44 @@ A plain connection/server error (as opposed to a usage error) does **not**
 start a cooldown - it just skips that provider for the current request, since
 there's nothing to "wait out."
 
-## Setup
+## Quick start on Windows
+
+Open **PowerShell** (Start menu, type "PowerShell"), paste this block and
+press Enter:
+
+```powershell
+& {
+  $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  $zip = Join-Path $env:TEMP 'lsl-bot.zip'; $unpacked = Join-Path $env:TEMP 'lsl-bot-download'; $dest = Join-Path $HOME 'lsl-bot'
+  Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/acid1596-sudo/lsl-bot/archive/refs/heads/main.zip' -OutFile $zip
+  if (Test-Path $unpacked) { Remove-Item $unpacked -Recurse -Force }
+  Expand-Archive -Path $zip -DestinationPath $unpacked
+  New-Item -ItemType Directory -Force -Path $dest | Out-Null
+  Copy-Item -Path (Join-Path (Get-ChildItem $unpacked -Directory)[0].FullName '*') -Destination $dest -Recurse -Force
+  & (Join-Path $dest 'start.cmd')
+}
+```
+
+That downloads the bot to `%USERPROFILE%\lsl-bot` and runs `start.cmd`. On the
+first run it:
+
+- asks for your OpenAI and/or Anthropic API key (hidden while you paste,
+  saved only in `.env`) and generates the shared secret;
+- asks whether to open a free Cloudflare tunnel so Second Life can reach the
+  bot without any router changes;
+- installs Python, Ollama and cloudflared with `winget` if they're missing
+  (Windows may ask for permission), then downloads the Ollama model - several
+  GB, one time only;
+- starts the bot, and writes a ready-to-paste Second Life script to
+  `data\chatbot.lsl` (also copied to your clipboard).
+
+After that, double-click `start.cmd` in that folder to start the bot. Pasting
+the block again updates the code and keeps your `.env`. The tunnel address
+changes on every start, so paste the new `data\chatbot.lsl` into your object
+after a restart.
+
+## Setup on other systems
 
 ```bash
 pip install -r requirements.txt
@@ -87,6 +124,7 @@ All configuration is via environment variables (or `.env` - see
 | `HOST`, `PORT` | Server bind address. Defaults to `127.0.0.1` (this machine only). |
 | `BOT_SHARED_SECRET` | When set, `/chat` and `/status` require a matching `X-Bot-Secret` header. |
 | `LOG_LEVEL` | Python log level, default `INFO`. Failover and hand-back events are logged at `WARNING`/`INFO`. |
+| `PUBLIC_TUNNEL` | Windows `start.cmd` only: `yes` opens a Cloudflare tunnel on every start, `no` keeps the bot on this PC. Empty = ask once. |
 
 ### Exposing it to Second Life
 
@@ -118,41 +156,23 @@ provider whether it's available or how many seconds until its cooldown ends.
 
 ### Calling it from an LSL script
 
-Since this repo is named after Second Life's scripting language: LSL objects
-can only reach the outside world over HTTP, via `llHTTPRequest`. A minimal
-example:
+LSL objects can only reach the outside world over HTTP (`llHTTPRequest`).
+[`scripts/chatbot.lsl`](scripts/chatbot.lsl) is a complete in-world chat
+script: the object's owner says `bot <anything>` in local chat and the reply
+is said back. On Windows, `start.cmd` fills in its `BOT_URL` and `BOT_SECRET`
+for you; elsewhere, replace those two placeholders yourself.
 
-```lsl
-string BOT_URL    = "https://YOUR_SERVER/chat";
-string BOT_SECRET = "the same value as BOT_SHARED_SECRET";
+It also handles a few things that are easy to miss in your own scripts:
 
-default
-{
-    touch_start(integer n)
-    {
-        llHTTPRequest(BOT_URL,
-            [HTTP_METHOD, "POST",
-             HTTP_MIMETYPE, "application/json",
-             HTTP_CUSTOM_HEADER, "X-Bot-Secret", BOT_SECRET,
-             HTTP_BODY_MAXLENGTH, 16384],
-            llList2Json(JSON_OBJECT, ["message", "Hello!"]));
-    }
+- the secret goes in an `X-Bot-Secret` header (`HTTP_CUSTOM_HEADER`);
+- `HTTP_BODY_MAXLENGTH` is raised to 16384, because LSL truncates responses at
+  2048 bytes by default, cutting a longer reply's JSON in half so
+  `llJsonGetValue` can't parse it;
+- long replies are split up, because `llSay` cuts a message off at 1024 bytes;
+- it only listens to the owner, so other people can't spend your API usage.
 
-    http_response(key id, integer status, list meta, string body)
-    {
-        if (status == 200)
-            llSay(0, llJsonGetValue(body, ["reply"]));
-        else
-            llOwnerSay("bot error " + (string)status);
-    }
-}
-```
-
-`HTTP_BODY_MAXLENGTH` matters: LSL truncates responses at 2048 bytes by
-default, which cuts a longer reply's JSON in half so `llJsonGetValue` can't
-parse it (16384 is the maximum for Mono scripts). Anyone who can open the
-script can read `BOT_SECRET`, so if you give the object away, make the script
-no-modify for the next owner.
+Anyone who can open the script can read `BOT_SECRET`, so if you give the
+object away, make the script no-modify for the next owner.
 
 ## Testing
 

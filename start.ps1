@@ -89,7 +89,9 @@ function Install-WithWinget([string]$Id, [string]$Name, [string]$ManualUrl) {
         throw "$Name isn't installed, and winget isn't available to install it automatically. Install it from $ManualUrl, then run start.cmd again."
     }
     Write-Host "Installing $Name (Windows may ask for permission)..."
-    & winget install --exact --id $Id --accept-package-agreements --accept-source-agreements
+    # Out-Host keeps winget's text on screen instead of in this function's
+    # return value, which would otherwise leak into callers like Start-Tunnel.
+    & winget install --exact --id $Id --accept-package-agreements --accept-source-agreements | Out-Host
     Update-SessionPath
 }
 
@@ -357,6 +359,8 @@ try {
     Set-Location -LiteralPath $Root
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+    # Pick up tools an earlier run installed, even if this window predates them.
+    Update-SessionPath
 
     Write-Host 'lsl-bot: the first run downloads Python, Ollama and a several-GB model, so it takes a while.'
     Initialize-EnvFile
@@ -369,27 +373,27 @@ try {
         $port = '8080'
     }
     $tunnel = $null
-    $lslPath = ''
-    if ($usePublic) {
-        $tunnel = Start-Tunnel "http://127.0.0.1:$port"
-        $lslPath = Write-LslScript "$($tunnel.Url)/chat" (Get-EnvValue $EnvFile 'BOT_SHARED_SECRET')
-    }
-
-    Write-Step 'lsl-bot is starting'
-    if ($tunnel) {
-        Write-Host "Public address:     $($tunnel.Url)/chat"
-        Write-Host "Second Life script: $lslPath (also copied to your clipboard)"
-        Write-Host 'In Second Life, open an object''s Contents, create a New Script, replace all of its'
-        Write-Host 'text with the clipboard and save. Then say "bot hello" in local chat.'
-        Write-Host 'The public address changes each time the bot starts, so paste the script again after a restart.'
-    } else {
-        Write-Host "Running on http://127.0.0.1:$port (this PC only)."
-        Write-Host 'To reach it from Second Life, set PUBLIC_TUNNEL=yes in .env and run start.cmd again.'
-    }
-    Write-Host 'Press Ctrl+C to stop.'
-    Write-Host ''
-
     try {
+        $lslPath = ''
+        if ($usePublic) {
+            $tunnel = Start-Tunnel "http://127.0.0.1:$port"
+            $lslPath = Write-LslScript "$($tunnel.Url)/chat" (Get-EnvValue $EnvFile 'BOT_SHARED_SECRET')
+        }
+
+        Write-Step 'lsl-bot is starting'
+        if ($tunnel) {
+            Write-Host "Public address:     $($tunnel.Url)/chat"
+            Write-Host "Second Life script: $lslPath (also copied to your clipboard)"
+            Write-Host 'In Second Life, open an object''s Contents, create a New Script, replace all of its'
+            Write-Host 'text with the clipboard and save. Then say "bot hello" in local chat.'
+            Write-Host 'The public address changes each time the bot starts, so paste the script again after a restart.'
+        } else {
+            Write-Host "Running on http://127.0.0.1:$port (this PC only)."
+            Write-Host 'To reach it from Second Life, set PUBLIC_TUNNEL=yes in .env and run start.cmd again.'
+        }
+        Write-Host 'Press Ctrl+C to stop.'
+        Write-Host ''
+
         & $VenvPython (Join-Path $Root 'run_server.py')
         Assert-ExitCode 'running the bot'
     } finally {

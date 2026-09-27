@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence
 
 from .providers.base import Message, Provider, ProviderError, UsageExhaustedError
 
@@ -39,6 +39,7 @@ class RouterResult:
     provider: str
     handover: bool
     attempts: List[str] = field(default_factory=list)
+    model: Optional[str] = None
 
 
 class FailoverRouter:
@@ -80,12 +81,21 @@ class FailoverRouter:
         self._state: Dict[str, ProviderState] = {}
         self._load_state()
 
+    @property
+    def fallback(self) -> Provider:
+        return self._fallback
+
     def provider_names(self) -> List[str]:
         return [p.name for p in self._primary_providers] + [self._fallback.name]
 
-    def generate(self, messages: List[Message], only: Optional[str] = None) -> RouterResult:
+    def generate(
+        self, messages: List[Message], only: Optional[str] = None, models: Optional[Mapping[str, str]] = None
+    ) -> RouterResult:
+        """``models`` maps a provider's name to the model it should use for
+        this request, such as {"ollama": "qwen3-coder:30b"} for a coding task."""
+        models = models or {}
         if only is not None:
-            return self._generate_with(only, messages)
+            return self._generate_with(only, messages, models)
 
         # The lock guards provider state only; it is never held across a
         # provider call, so one slow reply can't stall every other request.
@@ -98,8 +108,9 @@ class FailoverRouter:
                 attempts.append(f"{provider.name}: cooling down ({remaining:.0f}s left)")
                 continue
 
+            model = _model_for(provider, models)
             try:
-                text = provider.generate(messages)
+                text = provider.generate(messages, model=model)
             except UsageExhaustedError as exc:
                 with self._lock:
                     self._on_exhausted(provider.name, exc.retry_after)
@@ -111,10 +122,11 @@ class FailoverRouter:
 
             with self._lock:
                 self._on_success(provider.name)
-            return RouterResult(text=text, provider=provider.name, handover=False, attempts=attempts)
+            return RouterResult(text=text, provider=provider.name, handover=False, attempts=attempts, model=model)
 
+        model = _model_for(self._fallback, models)
         try:
-            text = self._fallback.generate(messages)
+            text = self._fallback.generate(messages, model=model)
         except ProviderError as exc:
             attempts.append(f"{self._fallback.name}: error - {exc}")
             raise RouterError(
@@ -125,25 +137,27 @@ class FailoverRouter:
             ) from exc
 
         attempts.append(f"{self._fallback.name}: ok")
-        return RouterResult(text=text, provider=self._fallback.name, handover=True, attempts=attempts)
+        return RouterResult(text=text, provider=self._fallback.name, handover=True, attempts=attempts, model=model)
 
-    def _generate_with(self, name: str, messages: List[Message]) -> RouterResult:
+    def _generate_with(self, name: str, messages: List[Message], models: Mapping[str, str]) -> RouterResult:
         # Exactly one provider, as chosen on the chat page - even one that's
         # cooling down, since its usage may have reset early.
         if name == self._fallback.name:
+            model = _model_for(self._fallback, models)
             try:
-                text = self._fallback.generate(messages)
+                text = self._fallback.generate(messages, model=model)
             except ProviderError as exc:
                 raise RouterError(
                     f"{name} failed: {exc}", reason="fallback", provider=name, fallback_error=str(exc)
                 ) from exc
-            return RouterResult(text=text, provider=name, handover=True, attempts=[f"{name}: ok"])
+            return RouterResult(text=text, provider=name, handover=True, attempts=[f"{name}: ok"], model=model)
 
         provider = next((p for p in self._primary_providers if p.name == name), None)
         if provider is None:
             raise ValueError(f"unknown provider {name!r}")
+        model = _model_for(provider, models)
         try:
-            text = provider.generate(messages)
+            text = provider.generate(messages, model=model)
         except UsageExhaustedError as exc:
             with self._lock:
                 self._on_exhausted(name, exc.retry_after)
@@ -152,25 +166,29 @@ class FailoverRouter:
             raise RouterError(f"{name} failed: {exc}", reason="error", provider=name) from exc
         with self._lock:
             self._on_success(name)
-        return RouterResult(text=text, provider=name, handover=False, attempts=[f"{name}: ok"])
+        return RouterResult(text=text, provider=name, handover=False, attempts=[f"{name}: ok"], model=model)
 
-    def status(self) -> dict:
+    def status(self, models: Optional[Mapping[str, str]] = None) -> dict:
+        """``models`` as for generate(), so Ollama is checked for the model
+        the current task would actually use."""
+        models = models or {}
+        fallback_model = _model_for(self._fallback, models)
         # health() may make a network call, so it runs before taking the lock.
-        fallback_health = self._fallback.health()
+        fallback_health = self._fallback.health(model=fallback_model)
         with self._lock:
             providers = {}
             for provider in self._primary_providers:
                 remaining = self._cooldown_remaining(provider.name)
                 providers[provider.name] = {
                     "role": "primary",
-                    "model": getattr(provider, "model", None),
+                    "model": _model_for(provider, models),
                     "available": remaining <= 0,
                     "problem": None,
                     "retry_in_seconds": round(remaining, 1) if remaining > 0 else None,
                 }
             providers[self._fallback.name] = {
                 "role": "fallback",
-                "model": getattr(self._fallback, "model", None),
+                "model": fallback_model,
                 "available": bool(fallback_health.get("available")),
                 "problem": fallback_health.get("problem"),
                 "retry_in_seconds": None,
@@ -249,3 +267,7 @@ class FailoverRouter:
         with open(tmp_path, "w") as f:
             json.dump(payload, f)
         os.replace(tmp_path, self._state_path)
+
+
+def _model_for(provider: Provider, models: Mapping[str, str]) -> Optional[str]:
+    return models.get(provider.name) or getattr(provider, "model", None)

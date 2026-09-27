@@ -26,9 +26,11 @@ class FakeProvider(Provider):
         self.name = name
         self._script = list(script)
         self.calls = 0
+        self.models = []
 
-    def generate(self, messages):
+    def generate(self, messages, model=None):
         self.calls += 1
+        self.models.append(model)
         if not self._script:
             raise AssertionError(f"{self.name}.generate() called more times than scripted")
         action = self._script.pop(0)
@@ -249,7 +251,7 @@ def test_slow_provider_call_does_not_block_other_requests():
             self._calls = 0
             self._calls_lock = threading.Lock()
 
-        def generate(self, messages):
+        def generate(self, messages, model=None):
             with self._calls_lock:
                 self._calls += 1
                 call_number = self._calls
@@ -286,7 +288,7 @@ def test_simultaneous_usage_errors_start_only_one_cooldown():
     class BurstProvider(Provider):
         name = "openai"
 
-        def generate(self, messages):
+        def generate(self, messages, model=None):
             both_in_flight.wait()
             raise UsageExhaustedError("quota exceeded")
 
@@ -322,7 +324,7 @@ def test_simultaneous_usage_errors_log_one_handover(caplog):
     class BurstProvider(Provider):
         name = "openai"
 
-        def generate(self, messages):
+        def generate(self, messages, model=None):
             both_in_flight.wait()
             raise UsageExhaustedError("rate limited", retry_after=30.0)
 
@@ -398,10 +400,63 @@ def test_fallback_failure_carries_ollamas_message():
 
 def test_status_reports_an_unhealthy_fallback():
     class DownOllama(FakeProvider):
-        def health(self):
+        def health(self, model=None):
             return {"available": False, "problem": "Ollama isn't reachable at http://127.0.0.1:11434"}
 
     router = make_router([FakeProvider("openai", [])], DownOllama("ollama", []), FakeClock())
     ollama = router.status()["providers"]["ollama"]
     assert ollama["available"] is False
     assert "isn't reachable" in ollama["problem"]
+
+
+# --- a model per request (tasks) -----------------------------------------------
+
+class ModelledProvider(FakeProvider):
+    def __init__(self, name, script, model):
+        super().__init__(name, script)
+        self.model = model
+
+
+def test_each_provider_uses_the_model_asked_for_or_its_own():
+    primary = ModelledProvider("openai", [UsageExhaustedError("quota"), "cloud reply"], "gpt-4o-mini")
+    fallback = ModelledProvider("ollama", ["local reply"], "llama3")
+    router = make_router([primary], fallback, FakeClock(), default_cooldown=0.0)
+    models = {"ollama": "qwen3-coder:30b"}
+
+    handed_over = router.generate([], models=models)
+    assert fallback.models == ["qwen3-coder:30b"]
+    assert handed_over.model == "qwen3-coder:30b"
+
+    back = router.generate([], models=models)
+    assert primary.models == ["gpt-4o-mini", "gpt-4o-mini"]
+    assert back.provider == "openai" and back.model == "gpt-4o-mini"
+
+
+def test_answer_with_ollama_uses_the_tasks_model_too():
+    fallback = ModelledProvider("ollama", ["local reply"], "llama3")
+    router = make_router([ModelledProvider("openai", [], "gpt-4o-mini")], fallback, FakeClock())
+
+    result = router.generate([], only="ollama", models={"ollama": "qwen3-coder:30b"})
+
+    assert fallback.models == ["qwen3-coder:30b"] and result.model == "qwen3-coder:30b"
+
+
+def test_status_checks_ollama_for_the_model_the_task_would_use():
+    class RecordingOllama(ModelledProvider):
+        checked = []
+
+        def health(self, model=None):
+            self.checked.append(model)
+            return {"available": True, "problem": None}
+
+    fallback = RecordingOllama("ollama", [], "llama3")
+    router = make_router([ModelledProvider("openai", [], "gpt-4o-mini")], fallback, FakeClock())
+
+    status = router.status(models={"ollama": "qwen3-coder:30b"})
+
+    assert fallback.checked == ["qwen3-coder:30b"]
+    assert status["providers"]["ollama"]["model"] == "qwen3-coder:30b"
+    assert status["providers"]["openai"]["model"] == "gpt-4o-mini"
+    assert router.status()["providers"]["ollama"]["model"] == "llama3"
+    assert router.fallback is fallback
+

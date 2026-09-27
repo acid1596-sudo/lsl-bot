@@ -4,7 +4,17 @@ const LABELS = { openai: "ChatGPT", anthropic: "Claude", ollama: "Ollama" };
 const KEY_STORAGE = "lslbot-key";
 const ANSWER_WITH_STORAGE = "lslbot-answer-with";
 
-const state = { key: "", conversations: [], current: null, status: null, sending: false, answerWith: "auto" };
+const state = {
+  key: "",
+  conversations: [],
+  current: null,
+  status: null,
+  sending: false,
+  answerWith: "auto",
+  tasks: [],
+  installedModels: null,
+  newChatTask: "general",
+};
 
 const $ = (id) => document.getElementById(id);
 
@@ -82,7 +92,8 @@ function formatWait(seconds) {
 
 async function refreshStatus() {
   try {
-    state.status = await api("/status");
+    // Ollama is checked for the model the current task would use.
+    state.status = await api(`/status?task=${encodeURIComponent(currentTaskId())}`);
   } catch (e) {
     if (!(e instanceof Unauthorized)) state.status = null;
   }
@@ -196,6 +207,105 @@ function renderAnswerWith() {
   }
 }
 
+// --- tasks: what kind of work, and which Ollama model does it ----------------
+
+const PLACEHOLDERS = {
+  general: "Message ChatGPT or Claude...",
+  mesh: "Describe the object to build, e.g. a wooden bar stool 75 cm tall...",
+  lsl: "Describe what the script should do in Second Life...",
+  code: "Describe the program or script you need...",
+};
+
+function currentTaskId() {
+  return state.current ? state.current.task || "general" : state.newChatTask;
+}
+
+function currentTask() {
+  return state.tasks.find((task) => task.id === currentTaskId()) || null;
+}
+
+async function loadTasks() {
+  try {
+    const body = await api("/api/tasks");
+    state.tasks = body.tasks;
+    state.installedModels = body.installed_models;
+  } catch (e) {
+    // Keep what was last known; the next refresh tries again.
+  }
+  renderTaskControls();
+}
+
+function setOptions(select, options) {
+  // Only rebuilt when something changed, so a list that's open stays open.
+  const describe = (pairs) => pairs.map(([value, label]) => `${value}\t${label}`).join("\n");
+  if (describe(options) === describe(Array.from(select.options).map((o) => [o.value, o.text]))) return;
+  select.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
+}
+
+function renderTaskControls() {
+  const taskSelect = $("task");
+  if (state.tasks.length) setOptions(taskSelect, state.tasks.map((task) => [task.id, task.label]));
+  taskSelect.value = currentTaskId();
+
+  const task = currentTask();
+  const modelSelect = $("task-model");
+  const note = $("task-note");
+  $("input").placeholder = PLACEHOLDERS[currentTaskId()] || PLACEHOLDERS.general;
+  if (!task) {
+    setOptions(modelSelect, [["", "Automatic"]]);
+    note.hidden = true;
+    return;
+  }
+
+  const names = [...(state.installedModels || [])];
+  if (task.chosen_model && !names.includes(task.chosen_model)) names.unshift(task.chosen_model);
+  setOptions(modelSelect, [["", `Automatic - ${task.automatic_model}`], ...names.map((name) => [name, name])]);
+  modelSelect.value = task.chosen_model;
+  modelSelect.title =
+    state.installedModels === null ? "Ollama isn't reachable, so its models can't be listed right now." : "";
+
+  note.textContent = task.description;
+  note.hidden = task.id === "general";
+}
+
+async function changeTask(taskId) {
+  if (state.current) {
+    try {
+      state.current = await api(`/api/conversations/${state.current.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ task: taskId }),
+      });
+    } catch (e) {
+      if (!(e instanceof Unauthorized)) showError(e.message);
+    }
+  } else {
+    state.newChatTask = taskId;
+  }
+  renderTaskControls();
+  refreshStatus();
+}
+
+async function changeTaskModel(model) {
+  const task = currentTask();
+  if (!task) return;
+  try {
+    const updated = await api(`/api/tasks/${encodeURIComponent(task.id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ model }),
+    });
+    state.tasks = state.tasks.map((t) => (t.id === updated.id ? updated : t));
+    toast(
+      model
+        ? `${task.label} tasks now use ${model} when Ollama answers.`
+        : `${task.label} tasks pick their Ollama model automatically again.`
+    );
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) showError(e.message);
+  }
+  renderTaskControls();
+  refreshStatus();
+}
+
 // --- conversations ----------------------------------------------------------
 
 async function loadConversations() {
@@ -229,6 +339,8 @@ async function openConversation(id) {
   hideError();
   renderConversation();
   renderConversationList();
+  renderTaskControls();
+  refreshStatus();
   closeSidebar();
   $("input").focus();
 }
@@ -236,9 +348,12 @@ async function openConversation(id) {
 function startNewChat() {
   // The conversation is only created when its first message is sent.
   state.current = null;
+  state.newChatTask = "general";
   hideError();
   renderConversation();
   renderConversationList();
+  renderTaskControls();
+  refreshStatus();
   closeSidebar();
   $("input").focus();
 }
@@ -253,13 +368,14 @@ async function deleteCurrent() {
   }
   state.current = null;
   renderConversation();
+  renderTaskControls();
   await loadConversations();
 }
 
 async function importChat(text, source) {
   state.current = await api("/api/conversations", {
     method: "POST",
-    body: JSON.stringify({ imported_text: text, source }),
+    body: JSON.stringify({ imported_text: text, source, task: currentTaskId() }),
   });
   renderConversation();
   await loadConversations();
@@ -300,10 +416,11 @@ function messageElement(message) {
     badge.className = "badge";
     if (message.provider === "ollama") {
       wrapper.classList.add("local");
-      badge.textContent = "Ollama (local backup)";
+      badge.textContent = message.model ? `Ollama (local backup) \u00b7 ${message.model}` : "Ollama (local backup)";
     } else {
       badge.textContent = providerLabel(message.provider);
     }
+    if (message.model) badge.title = message.model;
     wrapper.append(badge);
   }
   const bubble = document.createElement("div");
@@ -430,7 +547,10 @@ async function send() {
   showPending(text);
   try {
     if (!state.current) {
-      state.current = await api("/api/conversations", { method: "POST", body: "{}" });
+      state.current = await api("/api/conversations", {
+        method: "POST",
+        body: JSON.stringify({ task: currentTaskId() }),
+      });
     }
     const result = await api(`/api/conversations/${state.current.id}/messages`, {
       method: "POST",
@@ -521,7 +641,7 @@ function closeSidebar() {
 
 async function load() {
   try {
-    await Promise.all([loadConversations(), refreshStatus()]);
+    await Promise.all([loadConversations(), refreshStatus(), loadTasks()]);
   } catch (e) {
     if (!(e instanceof Unauthorized)) showError(e.message);
   }
@@ -573,6 +693,8 @@ function wireUp() {
     saveAnswerWith(event.target.value);
     renderAnswerWith();
   });
+  $("task").addEventListener("change", (event) => changeTask(event.target.value));
+  $("task-model").addEventListener("change", (event) => changeTaskModel(event.target.value));
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -582,5 +704,8 @@ document.addEventListener("DOMContentLoaded", () => {
   wireUp();
   renderConversation();
   load();
-  setInterval(refreshStatus, 15000);
+  setInterval(() => {
+    refreshStatus();
+    loadTasks();
+  }, 15000);
 });

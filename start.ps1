@@ -160,6 +160,12 @@ function Initialize-EnvFile {
     if (-not (Get-EnvValue $EnvFile 'BOT_SHARED_SECRET')) {
         Set-EnvValue $EnvFile 'BOT_SHARED_SECRET' (New-Secret)
     }
+
+    # Earlier versions capped Claude's replies at 1024 tokens, too short for a
+    # complete script. Only that old default is raised; a value someone chose stays.
+    if ((Get-EnvValue $EnvFile 'ANTHROPIC_MAX_TOKENS') -eq '1024') {
+        Set-EnvValue $EnvFile 'ANTHROPIC_MAX_TOKENS' '16000'
+    }
 }
 
 function Get-TunnelChoice {

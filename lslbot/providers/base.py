@@ -38,11 +38,12 @@ class Provider(ABC):
     name: str
 
     @abstractmethod
-    def generate(self, messages: List[Message]) -> str:
-        """Return the assistant's reply text for the given message history."""
+    def generate(self, messages: List[Message], model: Optional[str] = None) -> str:
+        """Return the assistant's reply text for the given message history,
+        using ``model`` instead of the provider's own model when given."""
         raise NotImplementedError
 
-    def health(self) -> dict:
+    def health(self, model: Optional[str] = None) -> dict:
         """Whether this provider looks usable right now, for the status bar.
         Cloud providers report usage problems through errors instead."""
         return {"available": True, "problem": None}

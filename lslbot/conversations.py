@@ -43,9 +43,16 @@ class ConversationStore:
                 )
         return sorted(summaries, key=lambda c: c["updated"], reverse=True)
 
-    def create(self, imported_text: str = "", source: str = "") -> dict:
+    def create(self, imported_text: str = "", source: str = "", task: str = "general") -> dict:
         now = time.time()
-        conversation = {"id": uuid.uuid4().hex, "title": DEFAULT_TITLE, "created": now, "updated": now, "messages": []}
+        conversation = {
+            "id": uuid.uuid4().hex,
+            "title": DEFAULT_TITLE,
+            "task": task,
+            "created": now,
+            "updated": now,
+            "messages": [],
+        }
         if imported_text.strip():
             source = source.strip() or "another chat"
             conversation["title"] = f"From {source}: {_title_from(imported_text, 40)}"
@@ -66,7 +73,18 @@ class ConversationStore:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return None
 
-    def add_exchange(self, conversation_id: str, user_text: str, reply_text: str, provider: str) -> Optional[dict]:
+    def set_task(self, conversation_id: str, task: str) -> Optional[dict]:
+        with self._lock:
+            conversation = self.get(conversation_id)
+            if conversation is None:
+                return None
+            conversation["task"] = task
+            self._write(conversation)
+            return conversation
+
+    def add_exchange(
+        self, conversation_id: str, user_text: str, reply_text: str, provider: str, model: Optional[str] = None
+    ) -> Optional[dict]:
         with self._lock:
             conversation = self.get(conversation_id)
             if conversation is None:
@@ -75,9 +93,10 @@ class ConversationStore:
             if conversation["title"] == DEFAULT_TITLE:
                 conversation["title"] = _title_from(user_text) or DEFAULT_TITLE
             conversation["messages"].append({"role": "user", "content": user_text, "at": now})
-            conversation["messages"].append(
-                {"role": "assistant", "content": reply_text, "provider": provider, "at": now}
-            )
+            reply = {"role": "assistant", "content": reply_text, "provider": provider, "at": now}
+            if model:
+                reply["model"] = model
+            conversation["messages"].append(reply)
             conversation["updated"] = now
             self._write(conversation)
             return conversation

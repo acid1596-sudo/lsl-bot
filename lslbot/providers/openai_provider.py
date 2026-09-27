@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import openai
 from openai import OpenAI
@@ -19,10 +19,10 @@ class OpenAIProvider(Provider):
         self.model = model
         self._client = OpenAI(api_key=api_key, max_retries=0)
 
-    def generate(self, messages: List[Message]) -> str:
+    def generate(self, messages: List[Message], model: Optional[str] = None) -> str:
         try:
             response = self._client.chat.completions.create(
-                model=self.model,
+                model=model or self.model,
                 messages=messages,
             )
         except openai.RateLimitError as exc:

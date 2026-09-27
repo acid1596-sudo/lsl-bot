@@ -15,6 +15,10 @@ It runs on your PC and gives you:
   Claude apps and pick the task up where it stopped. **Copy chat** does the
   reverse, so you can paste the conversation back into ChatGPT or Claude once
   their usage resets.
+- **Tasks** (General, Mesh for Second Life, LSL script, Code). Each gives every
+  model the same rules for that kind of work, and switches Ollama to a model
+  suited to it, such as a coding model for meshes and scripts (see
+  [Tasks](#tasks-the-right-ollama-model-for-the-job)).
 - **An OpenAI-compatible API** (`http://127.0.0.1:8080/v1`), so other programs
   that let you set an OpenAI API address get the same automatic handover.
 - Optionally, a script for **Second Life** objects (see
@@ -28,8 +32,9 @@ It runs on your PC and gives you:
 > The chatgpt.com and claude.ai websites and apps can't be taken over
 > automatically: they don't let another model continue their conversations,
 > and scripting them would break their terms. That's what the chat page and
-> Continue/Copy are for. Also bear in mind a local model is much less capable
+> Continue/Copy are for. Also bear in mind a local model is less capable
 > than ChatGPT or Claude, so work done while it's covering will be weaker.
+> Picking the right task and model narrows that gap a lot for scripts and code.
 
 ## Quick start on Windows
 
@@ -82,6 +87,10 @@ Pasting the block again updates the bot and keeps your `.env`.
 - **Copy chat** copies the whole conversation, including what Ollama did, with
   a note asking the model to continue. Paste it into ChatGPT or Claude to hand
   the task back to them.
+- **Task** (above the message box) says what kind of work the conversation
+  is. Each conversation keeps its own. **Ollama model** beside it is the model
+  Ollama uses for that task, in every conversation; see
+  [Tasks](#tasks-the-right-ollama-model-for-the-job).
 - **Answer with** (above the message box) is normally **Auto**: the automatic
   handover above. Choose **Ollama (on this PC) only** to pull a conversation to
   Ollama yourself, even while ChatGPT and Claude are fine. Choose ChatGPT or
@@ -94,6 +103,50 @@ Conversations are saved as files in `data\conversations` on your PC. The page
 asks for the bot's key if it doesn't have it; that's `BOT_SHARED_SECRET` in
 `.env`, and the shortcut and `start.cmd` fill it in for you.
 
+## Tasks: the right Ollama model for the job
+
+Pick a task above the message box, and every model that works on the
+conversation gets the same rules for that kind of work, including ChatGPT,
+Claude and Ollama as it's handed between them. Ollama also switches to the
+model you've set for that task.
+
+| Task | What it asks for | Ollama model it picks by itself |
+|---|---|---|
+| General | Nothing extra. | `OLLAMA_MODEL` (default `llama3`) |
+| Mesh for Second Life | One complete Blender script that builds the object, keeps it low-poly with named materials and UVs, and saves it as a `.glb` file to upload. | The biggest coding model you have installed (for example `qwen3-coder:30b`), otherwise `OLLAMA_MODEL` |
+| LSL script | Complete LSL scripts using only real functions, within Second Life's memory limits, with a note on how to test them. | Same as Mesh |
+| Code | Complete files that run as they are, with the PowerShell commands to run them. | Same as Mesh |
+
+To use a different model for a task, choose it in **Ollama model**. The list
+shows the models Ollama has installed, and the choice is saved for that task.
+**Automatic** goes back to the model it picks by itself. To add a model, run
+`ollama pull <name>` in PowerShell; it appears in the list within about
+half a minute.
+
+Ollama is also pushed to finish the job the way ChatGPT or Claude would:
+
+- It's told to carry on where the conversation stands and deliver complete
+  work, not an outline or a question back.
+- Its context window grows with the conversation, so a long hand-over isn't
+  cut off at the start. It starts at `OLLAMA_NUM_CTX` and doubles as needed,
+  up to what the model supports or `OLLAMA_MAX_CTX`, whichever is smaller.
+- A thinking model's reasoning is kept out of the reply. An empty reply
+  counts as a failure, so you can send again rather than get a blank answer.
+- Claude may use up to 16,000 tokens a reply (`ANTHROPIC_MAX_TOKENS`), so a
+  long script isn't cut short either.
+
+**Making a mesh.** With the Mesh task, ask for the object, for example
+"a wooden bar stool, 75 cm tall". Then:
+
+1. Install [Blender](https://www.blender.org/download/) 4.2 or later. Blender 5
+   no longer exports `.dae`, which is why the task uses `.glb`; Second Life
+   uploads it directly.
+2. In Blender, open the **Scripting** tab, click **New**, paste the script and
+   click **Run Script**. The `.glb` file is saved in your user folder.
+3. In the Second Life viewer, choose **Build > Upload > Model...**, pick the
+   file, let the viewer make the lower levels of detail, choose a simple
+   physics shape, click **Calculate Weights and Fee**, then **Upload**.
+
 ## Using it from other apps
 
 Anything that lets you set a custom OpenAI API address can use the bot:
@@ -102,6 +155,8 @@ Anything that lets you set a custom OpenAI API address can use the bot:
 - **API key:** the `BOT_SHARED_SECRET` value from `.env`
 - **Model:** `lslbot` (or anything else) for the automatic handover, or
   `lslbot/ollama`, `lslbot/openai`, `lslbot/anthropic` to use just that one.
+  Add `@mesh`, `@lsl` or `@code` to either to work as that task, such as
+  `lslbot@code` or `lslbot/ollama@mesh`.
 
 For example, with the official OpenAI Python library:
 
@@ -158,7 +213,8 @@ ones:
 | Ollama isn't reachable at http://127.0.0.1:11434 | Open the Ollama app from the Start menu (it runs in the system tray), then try again. |
 | ... isn't an address the bot can use - check OLLAMA_HOST | Fix `OLLAMA_HOST` in `.env`, or in Windows' environment variables if you set it there for Ollama. Forms like `0.0.0.0:11434` and `http://host:11434` both work. |
 | Ollama doesn't have the model 'llama3' yet | Run `ollama pull llama3` in PowerShell, or run `start.cmd` again. |
-| Ollama said: ... requires more system memory ... | Set `OLLAMA_NUM_CTX=4096` in `.env` (or try a smaller model), then restart the bot. |
+| Ollama said: ... requires more system memory ... | Pick a smaller model for the task, or lower `OLLAMA_MAX_CTX` (say to `16384`) or `OLLAMA_NUM_CTX` (say to `4096`) in `.env`, then restart the bot. |
+| ... gave an empty answer | Send the message again, or pick another Ollama model for the task. |
 | Ollama took longer than 600s to answer | Your PC is running the model slowly; raise `OLLAMA_TIMEOUT` in `.env`, or use a smaller model. |
 
 To test Ollama on its own, the same way the bot uses it, paste this into
@@ -200,9 +256,11 @@ for the full list with defaults):
 |---|---|
 | `PRIMARY_PROVIDERS` | Comma-separated priority chain, e.g. `openai,anthropic`. Each must be `openai` or `anthropic`. |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | ChatGPT credentials/model. |
-| `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_TOKENS` | Claude credentials/model. |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_TOKENS` | Claude credentials, model and the longest reply in tokens (default 16000). |
 | `OLLAMA_HOST`, `OLLAMA_MODEL` | Local fallback server and model. Default `http://127.0.0.1:11434` and `llama3`. `OLLAMA_HOST` is Ollama's own setting too: if it's set in Windows (say `0.0.0.0:11434`, to share Ollama on your network), that wins over `.env`, and the bot reads it the way Ollama does, so `0.0.0.0` means this PC. |
-| `OLLAMA_NUM_CTX` | How many tokens of the conversation Ollama can see, default 8192 (llama3's maximum). Lower it if Ollama runs out of memory. |
+| `OLLAMA_NUM_CTX` | The context window Ollama starts with, in tokens, default 8192. A model created with its own `num_ctx` keeps that. |
+| `OLLAMA_MAX_CTX` | The largest window the bot lets it grow to for long conversations, default 32768 (never more than the model supports). Lower it if Ollama runs out of memory. |
+| `TASKS_FILE` | Where the Ollama model picked for each task is saved, default `./data/tasks.json`. |
 | `OLLAMA_TIMEOUT` | Seconds to wait for Ollama's reply, default 600. |
 | `DEFAULT_COOLDOWN_SECONDS` | First cooldown when a provider is out of usage and sends no `Retry-After`. |
 | `MAX_COOLDOWN_SECONDS` | Cap on the growing cooldown. |
@@ -225,18 +283,24 @@ tunnel does this for you).
 
 - `GET /` - the chat page.
 - `GET /api/conversations`, `POST /api/conversations` (optionally with
-  `imported_text` and `source` to continue a pasted chat),
-  `GET`/`DELETE /api/conversations/<id>`, and
+  `imported_text` and `source` to continue a pasted chat, and `task`),
+  `GET`/`DELETE /api/conversations/<id>`, `PATCH /api/conversations/<id>`
+  with `{"task": "mesh"}` to change its task, and
   `POST /api/conversations/<id>/messages` with `{"content": "..."}` plus an
   optional `"provider"`: `auto` (default), `openai`, `anthropic` or `ollama`.
+- `GET /api/tasks` - each task with the Ollama model it uses, and the models
+  Ollama has installed (`null` if Ollama can't be asked).
+  `PUT /api/tasks/<id>` with `{"model": "qwen3-coder:30b"}` picks a model for
+  it; `{"model": ""}` goes back to the automatic one.
 - `POST /v1/chat/completions`, `GET /v1/models` - OpenAI-compatible (above).
 - `POST /chat` with `{"message": "...", "history": [...]}` returns
   `{"reply", "provider", "handover"}`; `handover` is `true` when Ollama
-  answered. It takes the same optional `"provider"`. This is what the Second
-  Life script uses.
+  answered. It takes the same optional `"provider"`, and an optional `"task"`.
+  This is what the Second Life script uses.
 - `GET /status` - each provider's model, whether it's available (for Ollama,
   whether it's reachable and has the model, with the problem if not) or how
-  long until its cooldown ends, and which one answers next.
+  long until its cooldown ends, and which one answers next. `?task=mesh`
+  checks Ollama for the model that task uses.
 - `GET /health` - liveness check.
 
 The key goes in an `X-Bot-Secret` header, or `Authorization: Bearer <key>`

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import anthropic
 from anthropic import Anthropic
@@ -13,16 +13,20 @@ class AnthropicProvider(Provider):
     name = "anthropic"
     DEFAULT_MODEL = "claude-opus-5-5"
 
-    def __init__(self, api_key: str, model: str = DEFAULT_MODEL, max_tokens: int = 1024):
+    # Long enough to finish a complete script, and still within what the SDK
+    # allows without streaming.
+    DEFAULT_MAX_TOKENS = 16000
+
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL, max_tokens: int = DEFAULT_MAX_TOKENS):
         if not api_key:
             raise ProviderError("ANTHROPIC_API_KEY is not set")
         self.model = model
         self.max_tokens = max_tokens
         self._client = Anthropic(api_key=api_key, max_retries=0)
 
-    def generate(self, messages: List[Message]) -> str:
+    def generate(self, messages: List[Message], model: Optional[str] = None) -> str:
         system, turns = _split_system_prompt(messages)
-        request = {"model": self.model, "max_tokens": self.max_tokens, "messages": turns}
+        request = {"model": model or self.model, "max_tokens": self.max_tokens, "messages": turns}
         if system:
             request["system"] = system
         try:

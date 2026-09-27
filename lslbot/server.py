@@ -11,6 +11,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from .config import build_router_from_env
 from .conversations import ConversationStore
 from .router import RouterError
+from .tasks import GENERAL, TASKS, TaskSettings, automatic_model, get_task, is_model_name
 
 # Load .env before anything reads the environment, so every setting (LOG_LEVEL
 # included) can live there. Real environment variables still win.
@@ -32,6 +33,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 router = build_router_from_env()
 store = ConversationStore(os.environ.get("CONVERSATIONS_DIR", "./data/conversations"))
+task_settings = TaskSettings(os.environ.get("TASKS_FILE", "./data/tasks.json").strip() or None)
 
 _ROLES = {"system": "system", "developer": "system", "user": "user", "assistant": "assistant"}
 
@@ -90,7 +92,7 @@ def _plain_messages(raw_messages) -> list:
 _LABELS = {"openai": "ChatGPT", "anthropic": "Claude", "ollama": "Ollama"}
 
 
-class _BadProvider(ValueError):
+class _BadChoice(ValueError):
     pass
 
 
@@ -99,8 +101,50 @@ def _chosen_provider(value):
     if value in (None, "", "auto"):
         return None
     if value not in router.provider_names():
-        raise _BadProvider(f"unknown provider {value!r}; use auto or one of {router.provider_names()}")
+        raise _BadChoice(f"unknown provider {value!r}; use auto or one of {router.provider_names()}")
     return value
+
+
+def _requested_task(value):
+    """A task named in a request; leaving it out means General."""
+    if value in (None, ""):
+        return GENERAL
+    task = get_task(value)
+    if task is None:
+        raise _BadChoice(f"unknown task {value!r}; use one of {[t.id for t in TASKS]}")
+    return task
+
+
+def _stored_task(conversation):
+    # Conversations from before tasks existed are General.
+    return get_task(conversation.get("task")) or GENERAL
+
+
+def _ollama_model(task) -> str:
+    """The model picked for the task on the chat page, else its automatic
+    one. Only code tasks need the list of installed models to decide."""
+    chosen = task_settings.chosen_model(task.id)
+    if chosen:
+        return chosen
+    installed = router.fallback.installed_models() if task.wants_code_model else None
+    return automatic_model(task, router.fallback.model, installed)
+
+
+def _models_for(task) -> dict:
+    return {router.fallback.name: _ollama_model(task)}
+
+
+def _json_object() -> dict:
+    body = request.get_json(silent=True)
+    return body if isinstance(body, dict) else {}
+
+
+def _with_instructions(task, messages):
+    # Sent to whichever provider answers, so the task keeps its rules when it
+    # moves between ChatGPT, Claude and Ollama.
+    if not task.instructions:
+        return messages
+    return [{"role": "system", "content": task.instructions}] + messages
 
 
 def _explain(exc: RouterError, only) -> str:
@@ -116,10 +160,10 @@ def _explain(exc: RouterError, only) -> str:
     return f"ChatGPT/Claude couldn't be used, and Ollama couldn't answer either. {exc.fallback_error}"
 
 
-def _generate(messages, only=None):
+def _generate(messages, only=None, task=GENERAL):
     """Returns (result, None) or (None, user-facing explanation)."""
     try:
-        return router.generate(messages, only=only), None
+        return router.generate(_with_instructions(task, messages), only=only, models=_models_for(task)), None
     except RouterError as exc:
         logger.error("no provider could answer: %s", exc)
         return None, _explain(exc, only)
@@ -137,7 +181,49 @@ def health():
 
 @app.get("/status")
 def status():
-    return jsonify(router.status())
+    # ?task= checks Ollama for the model that task would use.
+    task = get_task(request.args.get("task")) or GENERAL
+    return jsonify(router.status(models=_models_for(task)))
+
+
+def _task_view(task, installed):
+    chosen = task_settings.chosen_model(task.id)
+    automatic = automatic_model(task, router.fallback.model, installed)
+    return {
+        "id": task.id,
+        "label": task.label,
+        "description": task.description,
+        "chosen_model": chosen,
+        "automatic_model": automatic,
+        "model": chosen or automatic,
+    }
+
+
+@app.get("/api/tasks")
+def list_tasks():
+    installed = router.fallback.installed_models()
+    return jsonify(
+        {
+            "tasks": [_task_view(task, installed) for task in TASKS],
+            # None when Ollama can't be asked, so the page can say so.
+            "installed_models": None if installed is None else sorted(m["name"] for m in installed),
+        }
+    )
+
+
+@app.put("/api/tasks/<task_id>")
+def choose_task_model(task_id):
+    task = get_task(task_id)
+    if task is None:
+        return jsonify({"error": "task not found"}), 404
+    payload = _json_object()
+    if "model" not in payload:
+        return jsonify({"error": "'model' is required; an empty one means automatic"}), 400
+    model = payload["model"] or ""
+    if model and not is_model_name(model):
+        return jsonify({"error": "'model' must be an Ollama model name, such as qwen3-coder:30b"}), 400
+    task_settings.choose_model(task.id, model)
+    return jsonify(_task_view(task, router.fallback.installed_models()))
 
 
 @app.post("/chat")
@@ -148,11 +234,12 @@ def chat():
         return jsonify({"error": "'message' is required"}), 400
     try:
         only = _chosen_provider(payload.get("provider"))
-    except _BadProvider as exc:
+        task = _requested_task(payload.get("task"))
+    except _BadChoice as exc:
         return jsonify({"error": str(exc)}), 400
 
     result, problem = _generate(
-        _plain_messages(payload.get("history")) + [{"role": "user", "content": message}], only
+        _plain_messages(payload.get("history")) + [{"role": "user", "content": message}], only, task
     )
     if result is None:
         return jsonify({"error": NO_PROVIDER_ERROR, "detail": problem}), 503
@@ -171,12 +258,31 @@ def create_conversation():
     source = payload.get("source") or ""
     if not isinstance(imported_text, str) or not isinstance(source, str):
         return jsonify({"error": "'imported_text' and 'source' must be strings"}), 400
-    return jsonify(store.create(imported_text, source[:40])), 201
+    try:
+        task = _requested_task(payload.get("task"))
+    except _BadChoice as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(store.create(imported_text, source[:40], task.id)), 201
 
 
 @app.get("/api/conversations/<conversation_id>")
 def get_conversation(conversation_id):
     conversation = store.get(conversation_id)
+    if conversation is None:
+        return jsonify({"error": "conversation not found"}), 404
+    return jsonify(conversation)
+
+
+@app.patch("/api/conversations/<conversation_id>")
+def update_conversation(conversation_id):
+    payload = _json_object()
+    if "task" not in payload:
+        return jsonify({"error": "'task' is required"}), 400
+    try:
+        task = _requested_task(payload["task"])
+    except _BadChoice as exc:
+        return jsonify({"error": str(exc)}), 400
+    conversation = store.set_task(conversation_id, task.id)
     if conversation is None:
         return jsonify({"error": "conversation not found"}), 404
     return jsonify(conversation)
@@ -200,13 +306,15 @@ def send_message(conversation_id):
         return jsonify({"error": "'content' is required"}), 400
     try:
         only = _chosen_provider(payload.get("provider"))
-    except _BadProvider as exc:
+    except _BadChoice as exc:
         return jsonify({"error": str(exc)}), 400
 
-    result, problem = _generate(store.history(conversation) + [{"role": "user", "content": content}], only)
+    result, problem = _generate(
+        store.history(conversation) + [{"role": "user", "content": content}], only, _stored_task(conversation)
+    )
     if result is None:
         return jsonify({"error": NO_PROVIDER_ERROR, "detail": problem}), 503
-    updated = store.add_exchange(conversation_id, content, result.text, result.provider)
+    updated = store.add_exchange(conversation_id, content, result.text, result.provider, result.model)
     if updated is None:
         return jsonify({"error": "conversation not found"}), 404
     return jsonify({"conversation": updated, "handover": result.handover})
@@ -218,16 +326,24 @@ def _openai_error(message: str, status_code: int, error_type: str):
 
 @app.get("/v1/models")
 def openai_models():
-    # "lslbot" is the usual failover; "lslbot/<name>" uses only that provider.
-    ids = ["lslbot"] + [f"lslbot/{name}" for name in router.provider_names()]
+    # "lslbot" is the usual failover; "lslbot/<name>" uses only that provider,
+    # and "@<task>" on either (say "lslbot@mesh") works as that task.
+    ids = (
+        ["lslbot"]
+        + [f"lslbot/{name}" for name in router.provider_names()]
+        + [f"lslbot@{task.id}" for task in TASKS if task is not GENERAL]
+    )
     return jsonify({"object": "list", "data": [{"id": i, "object": "model", "owned_by": "lslbot"} for i in ids]})
 
 
-def _provider_for_model(model):
+def _route_for_model(model):
+    """(provider or None for the failover, task) from a model name; any
+    name the bot doesn't know gets the failover and the General task."""
     if not isinstance(model, str):
-        return None
-    name = model[len("lslbot/"):] if model.startswith("lslbot/") else model
-    return name if name in router.provider_names() else None
+        return None, GENERAL
+    name, _, task_id = model.partition("@")
+    name = name[len("lslbot/"):] if name.startswith("lslbot/") else name
+    return (name if name in router.provider_names() else None), get_task(task_id) or GENERAL
 
 
 @app.post("/v1/chat/completions")
@@ -237,7 +353,7 @@ def openai_chat_completions():
     if not messages:
         return _openai_error("'messages' must contain at least one text message", 400, "invalid_request_error")
 
-    result, problem = _generate(messages, _provider_for_model(payload.get("model")))
+    result, problem = _generate(messages, *_route_for_model(payload.get("model")))
     if result is None:
         return _openai_error(problem, 503, "server_error")
 

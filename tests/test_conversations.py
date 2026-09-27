@@ -71,3 +71,19 @@ def test_writes_leave_no_temp_files(tmp_path):
     conversation = store.create()
     store.add_exchange(conversation["id"], "hi", "hello", "anthropic")
     assert sorted(os.listdir(tmp_path)) == [f"{conversation['id']}.json"]
+
+
+def test_a_conversation_keeps_its_task_and_the_model_behind_each_reply(tmp_path):
+    store = ConversationStore(str(tmp_path))
+    conversation = store.create(task="mesh")
+    assert conversation["task"] == "mesh"
+    assert store.create()["task"] == "general"
+
+    assert store.set_task(conversation["id"], "lsl")["task"] == "lsl"
+    assert store.get(conversation["id"])["task"] == "lsl"
+    assert store.set_task("0" * 32, "lsl") is None
+
+    updated = store.add_exchange(conversation["id"], "a door script", "Here it is", "ollama", "qwen3-coder:30b")
+    assert updated["messages"][-1]["model"] == "qwen3-coder:30b"
+    no_model = store.add_exchange(conversation["id"], "thanks", "You're welcome", "openai")
+    assert "model" not in no_model["messages"][-1]

@@ -12,6 +12,7 @@ def _import_server(monkeypatch, tmp_path, shared_secret=None):
     monkeypatch.setenv("PRIMARY_PROVIDERS", "openai")
     monkeypatch.setenv("STATE_FILE", str(tmp_path / "state.json"))
     monkeypatch.setenv("CONVERSATIONS_DIR", str(tmp_path / "conversations"))
+    monkeypatch.setenv("TASKS_FILE", str(tmp_path / "tasks.json"))
     if shared_secret is None:
         monkeypatch.delenv("BOT_SHARED_SECRET", raising=False)
     else:
@@ -38,24 +39,40 @@ def secured_app_module(monkeypatch, tmp_path):
     return server
 
 
+class StubFallback:
+    name = "ollama"
+    model = "llama3"
+
+    def __init__(self, installed=None):
+        self.installed = installed
+
+    def installed_models(self):
+        return self.installed
+
+
 class StubRouter:
-    def __init__(self, result=None, error=None):
+    def __init__(self, result=None, error=None, installed=None):
         self._result = result
         self._error = error
+        self.fallback = StubFallback(installed)
         self.messages_seen = None
         self.only_seen = "not called"
+        self.models_seen = None
+        self.status_models_seen = None
 
     def provider_names(self):
         return ["openai", "ollama"]
 
-    def generate(self, messages, only=None):
+    def generate(self, messages, only=None, models=None):
         self.messages_seen = messages
         self.only_seen = only
+        self.models_seen = models
         if self._error:
             raise self._error
         return self._result
 
-    def status(self):
+    def status(self, models=None):
+        self.status_models_seen = models
         return {"active_provider": "ollama", "providers": {}}
 
 
@@ -374,4 +391,163 @@ def test_openai_clients_pick_a_provider_by_model_name(app_module):
     assert app_module.router.only_seen is None
 
     ids = [m["id"] for m in client.get("/v1/models").get_json()["data"]]
-    assert ids == ["lslbot", "lslbot/openai", "lslbot/ollama"]
+    assert ids == ["lslbot", "lslbot/openai", "lslbot/ollama", "lslbot@mesh", "lslbot@lsl", "lslbot@code"]
+
+
+# --- tasks: instructions and the Ollama model for each kind of work ---------
+
+CODERS = [{"name": "llama3:latest", "size": 4}, {"name": "qwen3-coder:30b", "size": 18}]
+
+
+def _ok(provider="ollama", model="qwen3-coder:30b"):
+    return RouterResult(text="done", provider=provider, handover=provider == "ollama", attempts=[], model=model)
+
+
+def test_tasks_list_their_automatic_models(app_module):
+    app_module.router = StubRouter(installed=CODERS)
+    body = app_module.app.test_client().get("/api/tasks").get_json()
+
+    tasks = {t["id"]: t for t in body["tasks"]}
+    assert list(tasks) == ["general", "mesh", "lsl", "code"]
+    assert tasks["general"]["model"] == "llama3"
+    assert tasks["mesh"] == {
+        "id": "mesh",
+        "label": "Mesh for Second Life",
+        "description": tasks["mesh"]["description"],
+        "chosen_model": "",
+        "automatic_model": "qwen3-coder:30b",
+        "model": "qwen3-coder:30b",
+    }
+    assert body["installed_models"] == ["llama3:latest", "qwen3-coder:30b"]
+
+
+def test_tasks_say_when_ollama_cant_list_its_models(app_module):
+    app_module.router = StubRouter(installed=None)
+    body = app_module.app.test_client().get("/api/tasks").get_json()
+    assert body["installed_models"] is None
+    assert {t["model"] for t in body["tasks"]} == {"llama3"}
+
+
+def test_picking_a_model_for_a_task_is_saved(app_module, tmp_path):
+    app_module.router = StubRouter(installed=CODERS)
+    client = app_module.app.test_client()
+
+    picked = client.put("/api/tasks/mesh", json={"model": "gpt-oss:20b"})
+    assert picked.status_code == 200 and picked.get_json()["model"] == "gpt-oss:20b"
+    assert '"mesh": "gpt-oss:20b"' in (tmp_path / "tasks.json").read_text()
+
+    back = client.put("/api/tasks/mesh", json={"model": ""}).get_json()
+    assert back["chosen_model"] == "" and back["model"] == "qwen3-coder:30b"
+
+    assert client.put("/api/tasks/mesh", json={"model": "no spaces allowed"}).status_code == 400
+    assert client.put("/api/tasks/mesh", json={"model": 42}).status_code == 400
+    assert client.put("/api/tasks/painting", json={"model": "llama3"}).status_code == 404
+
+
+def test_a_mesh_conversation_sends_its_instructions_and_ollama_model(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={"task": "mesh"}).get_json()
+    assert conversation["task"] == "mesh"
+
+    body = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "a bar stool"}).get_json()
+
+    instructions, question = app_module.router.messages_seen
+    assert instructions["role"] == "system" and "Blender Python script" in instructions["content"]
+    assert question == {"role": "user", "content": "a bar stool"}
+    assert app_module.router.models_seen == {"ollama": "qwen3-coder:30b"}
+    assert body["conversation"]["messages"][-1]["model"] == "qwen3-coder:30b"
+
+
+def test_a_picked_model_beats_the_automatic_one(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+    client.put("/api/tasks/lsl", json={"model": "gpt-oss:20b"})
+    conversation = client.post("/api/conversations", json={"task": "lsl"}).get_json()
+
+    client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "a door script"})
+
+    assert app_module.router.models_seen == {"ollama": "gpt-oss:20b"}
+
+
+def test_general_conversations_get_no_instructions_and_the_usual_model(app_module):
+    app_module.router = StubRouter(result=_ok(model="llama3"), installed=CODERS)
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hi"})
+
+    assert app_module.router.messages_seen == [{"role": "user", "content": "hi"}]
+    assert app_module.router.models_seen == {"ollama": "llama3"}
+
+
+def test_changing_a_conversations_task(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    changed = client.patch(f"/api/conversations/{conversation['id']}", json={"task": "code"})
+    assert changed.status_code == 200 and changed.get_json()["task"] == "code"
+    client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "a backup script"})
+    assert "complete files" in app_module.router.messages_seen[0]["content"]
+
+    assert client.patch(f"/api/conversations/{conversation['id']}", json={"task": "painting"}).status_code == 400
+    assert client.patch(f"/api/conversations/{conversation['id']}", json={}).status_code == 400
+    assert client.patch(f"/api/conversations/{conversation['id']}", json=["task"]).status_code == 400
+    assert client.put("/api/tasks/mesh", json=["model"]).status_code == 400
+    assert client.put("/api/tasks/mesh", json={}).status_code == 400
+    assert client.patch(f"/api/conversations/{'0' * 32}", json={"task": "code"}).status_code == 404
+    assert client.post("/api/conversations", json={"task": "painting"}).status_code == 400
+
+
+def test_conversations_from_before_tasks_are_general(app_module):
+    app_module.router = StubRouter(result=_ok(model="llama3"), installed=CODERS)
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+    path = app_module.store._path(conversation["id"])
+    import json as _json
+    with open(path) as f:
+        stored = _json.load(f)
+    del stored["task"]
+    with open(path, "w") as f:
+        _json.dump(stored, f)
+
+    resp = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hi"})
+
+    assert resp.status_code == 200
+    assert app_module.router.messages_seen == [{"role": "user", "content": "hi"}]
+
+
+def test_status_checks_ollama_for_the_tasks_model(app_module):
+    app_module.router = StubRouter(installed=CODERS)
+    client = app_module.app.test_client()
+
+    client.get("/status?task=mesh")
+    assert app_module.router.status_models_seen == {"ollama": "qwen3-coder:30b"}
+    client.get("/status")
+    assert app_module.router.status_models_seen == {"ollama": "llama3"}
+    client.get("/status?task=painting")
+    assert app_module.router.status_models_seen == {"ollama": "llama3"}
+
+
+def test_openai_clients_pick_a_task_with_an_at_sign(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+    messages = [{"role": "user", "content": "a lamp"}]
+
+    client.post("/v1/chat/completions", json={"model": "lslbot/ollama@mesh", "messages": messages})
+    assert app_module.router.only_seen == "ollama"
+    assert app_module.router.models_seen == {"ollama": "qwen3-coder:30b"}
+    assert "Blender" in app_module.router.messages_seen[0]["content"]
+
+    client.post("/v1/chat/completions", json={"model": "lslbot@nonsense", "messages": messages})
+    assert app_module.router.only_seen is None and app_module.router.messages_seen == messages
+
+
+def test_second_life_chat_can_name_a_task(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+
+    assert client.post("/chat", json={"message": "a door script", "task": "lsl"}).status_code == 200
+    assert "LSL" in app_module.router.messages_seen[0]["content"]
+    assert client.post("/chat", json={"message": "hi", "task": "painting"}).status_code == 400

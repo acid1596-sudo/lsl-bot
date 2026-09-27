@@ -13,7 +13,7 @@ _PRIMARY_PROVIDER_FACTORIES = {
     "anthropic": lambda: AnthropicProvider(
         api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
         model=os.environ.get("ANTHROPIC_MODEL") or AnthropicProvider.DEFAULT_MODEL,
-        max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS") or 1024),
+        max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS") or AnthropicProvider.DEFAULT_MAX_TOKENS),
     ),
 }
 
@@ -38,6 +38,7 @@ def build_router_from_env() -> FailoverRouter:
         host=configured_url(),
         model=os.environ.get("OLLAMA_MODEL") or "llama3",
         num_ctx=int(os.environ.get("OLLAMA_NUM_CTX") or 8192),
+        max_ctx=int(os.environ.get("OLLAMA_MAX_CTX") or 32768),
         timeout=float(os.environ.get("OLLAMA_TIMEOUT") or 600),
     )
 

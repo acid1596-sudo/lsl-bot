@@ -1,52 +1,35 @@
 # lsl-bot
 
-A small HTTP backend that answers chat requests using ChatGPT (OpenAI) or
-Claude (Anthropic), and **automatically fails over to a local Ollama model
-when those providers run out of usage** - a rate limit or a billing/quota
-cap - then **hands tasks back automatically once the provider's usage
-resets**. No manual intervention needed either way.
+Keeps your ChatGPT and Claude work going when their usage runs out. A local
+[Ollama](https://ollama.com) model picks up **the same conversation** and
+carries on, then **hands it back automatically** once ChatGPT or Claude is
+available again. No manual step either way.
 
-> **Scope note:** this talks to the official OpenAI and Anthropic *developer
-> APIs* (the same ones any app built on GPT/Claude uses), not the
-> chatgpt.com / claude.ai consumer web apps. Those apps have their own
-> "you've hit your limit, resets at ..." caps, but automating a consumer
-> account through the browser to work around that would be fragile and
-> against those products' terms of service, so this project doesn't do that.
-> If your ChatGPT/Claude "usage" is actually a Plus/Pro web subscription
-> rather than API billing, you'd point `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
-> at a developer API key instead (they're billed separately from the web
-> subscriptions).
+It runs on your PC and gives you:
 
-## How the handover works
+- **A chat page** (`http://127.0.0.1:8080`) where you talk to ChatGPT or
+  Claude. When their usage runs out, Ollama answers the next message with the
+  full conversation so far. Each reply is labelled with who wrote it, and a
+  status bar shows who's out of usage and when they're due back.
+- **Continue a ChatGPT/Claude chat**: paste a conversation from the ChatGPT or
+  Claude apps and pick the task up where it stopped. **Copy chat** does the
+  reverse, so you can paste the conversation back into ChatGPT or Claude once
+  their usage resets.
+- **An OpenAI-compatible API** (`http://127.0.0.1:8080/v1`), so other programs
+  that let you set an OpenAI API address get the same automatic handover.
+- Optionally, a script for **Second Life** objects (see
+  [Second Life](#second-life-optional)).
 
-Requests go through a priority chain, e.g. `openai -> anthropic -> ollama`
-(configurable). For each request:
-
-1. The router tries each configured primary provider in order.
-2. If a provider's call fails because it's **out of usage** (HTTP 429 - rate
-   limit or quota/billing cap), that provider is put on a cooldown and the
-   request is immediately retried on the next provider in the chain.
-3. If every primary provider is cooling down or fails, the request goes to
-   **Ollama** (local, no usage cap to run out of) so the task still
-   completes.
-4. The cooldown length comes from the provider's own `Retry-After` header
-   when it sends one. When it doesn't (typical for a billing/quota cap,
-   which has no known reset time), the router uses a default cooldown that
-   **doubles each time the provider is still exhausted** right after its
-   previous cooldown expires, up to a configurable cap - so it naturally
-   waits longer for a provider that's been down for a while without ever
-   needing to know the real reset time in advance.
-5. The moment a primary provider's cooldown expires, the **very next**
-   request tries it again automatically. The first success clears its
-   cooldown - that's the hand-back, no separate step required.
-
-Provider state (who's cooling down, until when) is persisted to a small JSON
-file so a restart doesn't forget an in-progress cooldown and re-hammer a
-provider that's still exhausted.
-
-A plain connection/server error (as opposed to a usage error) does **not**
-start a cooldown - it just skips that provider for the current request, since
-there's nothing to "wait out."
+> **What it can and can't take over.** It uses the official OpenAI and
+> Anthropic *developer APIs* with your API keys. ChatGPT Plus and Claude Pro
+> subscriptions don't include API access, so you need keys from
+> [platform.openai.com/api-keys](https://platform.openai.com/api-keys) and/or
+> [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys).
+> The chatgpt.com and claude.ai websites and apps can't be taken over
+> automatically: they don't let another model continue their conversations,
+> and scripting them would break their terms. That's what the chat page and
+> Continue/Copy are for. Also bear in mind a local model is much less capable
+> than ChatGPT or Claude, so work done while it's covering will be weaker.
 
 ## Quick start on Windows
 
@@ -71,45 +54,107 @@ That downloads the bot to `%USERPROFILE%\lsl-bot` and runs `start.cmd`. On the
 first run it:
 
 - asks for your OpenAI and/or Anthropic API key (hidden while you paste,
-  saved only in `.env`) and generates the shared secret;
-- asks whether to open a free Cloudflare tunnel so Second Life can reach the
-  bot without any router changes;
+  saved only in `.env`) and generates the bot's secret key;
+- adds an **lsl-bot shortcut to your desktop**;
+- asks whether to open a free Cloudflare tunnel. You only need that for Second
+  Life, or to use the chat page from another device such as your phone;
 - installs Python, Ollama and cloudflared with `winget` if they're missing
   (Windows may ask for permission), then downloads the Ollama model - several
   GB, one time only;
-- starts the bot, and writes a ready-to-paste Second Life script to
-  `data\chatbot.lsl` (also copied to your clipboard).
+- starts the bot and opens the chat page in your browser.
 
-After that, double-click `start.cmd` in that folder to start the bot. Pasting
-the block again updates the code and keeps your `.env`. The tunnel address
-changes on every start, so paste the new `data\chatbot.lsl` into your object
-after a restart.
+After that, **double-click the lsl-bot shortcut** on your desktop. If the bot
+is already running, the shortcut just opens the chat page again. Keep the bot's
+window open while you use it; close it (or press Ctrl+C) to stop the bot.
+Pasting the block again updates the bot and keeps your `.env`.
+
+## Using the chat page
+
+- **New chat** starts a conversation. ChatGPT (or Claude, if that's first in
+  `PRIMARY_PROVIDERS`) answers first.
+- When usage runs out, the next reply comes from Ollama. It's labelled
+  **Ollama (local backup)** and marked "Ollama took over from ChatGPT". The
+  status bar shows when ChatGPT is due back. As soon as it is, replies switch
+  back ("Handed back to ChatGPT").
+- **Continue a ChatGPT/Claude chat**: in the ChatGPT or Claude app, select the
+  whole conversation, copy it and paste it into this box. The task carries on
+  from there with whichever model is available.
+- **Copy chat** copies the whole conversation, including what Ollama did, with
+  a note asking the model to continue. Paste it into ChatGPT or Claude to hand
+  the task back to them.
+
+Conversations are saved as files in `data\conversations` on your PC. The page
+asks for the bot's key if it doesn't have it; that's `BOT_SHARED_SECRET` in
+`.env`, and the shortcut and `start.cmd` fill it in for you.
+
+## Using it from other apps
+
+Anything that lets you set a custom OpenAI API address can use the bot:
+
+- **API address / base URL:** `http://127.0.0.1:8080/v1`
+- **API key:** the `BOT_SHARED_SECRET` value from `.env`
+- **Model:** anything; the bot picks ChatGPT, Claude or Ollama itself.
+
+For example, with the official OpenAI Python library:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="<BOT_SHARED_SECRET from .env>")
+reply = client.chat.completions.create(model="lslbot", messages=[{"role": "user", "content": "Hello"}])
+print(reply.choices[0].message.content)
+```
+
+`reply.model` says who answered (`lslbot/openai`, `lslbot/anthropic` or
+`lslbot/ollama`). Only text chat is supported: images and tool/function calls
+are dropped, and a streamed reply arrives in one piece. That means coding
+agents that rely on tool calls won't work through it.
+
+## How the handover works
+
+Requests go through a priority chain, e.g. `openai -> anthropic -> ollama`
+(configurable). For each request:
+
+1. The bot tries each configured primary provider in order.
+2. If a provider's call fails because it's **out of usage** (HTTP 429: a rate
+   limit or a quota/billing cap), that provider is put on a cooldown and the
+   request is immediately retried on the next provider in the chain.
+3. If every primary provider is cooling down or fails, the request goes to
+   **Ollama** (local, no usage cap to run out of) so the task still completes.
+   It's given the whole conversation, and asked for a context window big
+   enough to see it (`OLLAMA_NUM_CTX`).
+4. The cooldown length comes from the provider's own `Retry-After` header
+   when it sends one. When it doesn't (typical for a billing/quota cap, which
+   has no known reset time), the bot uses a default cooldown that **doubles
+   each time the provider is still exhausted** right after its previous
+   cooldown expires, up to a cap. So it waits longer for a provider that's
+   been down a while, without ever needing to know the real reset time.
+5. The moment a cooldown expires, the **very next** request tries that
+   provider again. The first success clears its cooldown - that's the
+   hand-back, no separate step required.
+
+Cooldowns are saved to a small JSON file, so a restart doesn't forget one and
+go straight back to a provider that's still out of usage. A plain connection
+or server error (as opposed to a usage error) does **not** start a cooldown;
+it just skips that provider for the current request. Requests run in
+parallel, and a burst of simultaneous 429s counts as one exhaustion rather
+than escalating the cooldown once per request.
 
 ## Setup on other systems
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env   # then fill in your API keys
-```
-
-You'll also need a local [Ollama](https://ollama.com) install with a model
-pulled, e.g.:
-
-```bash
+cp .env.example .env   # then fill in your API keys and a long random BOT_SHARED_SECRET
 ollama pull llama3
-ollama serve   # usually already running as a service after install
-```
-
-Run the server:
-
-```bash
 python run_server.py
 ```
 
+Then open `http://127.0.0.1:8080/#key=<your BOT_SHARED_SECRET>`.
+
 ## Configuration
 
-All configuration is via environment variables (or `.env` - see
-`.env.example` for the full list with defaults):
+All configuration is via environment variables or `.env` (see `.env.example`
+for the full list with defaults):
 
 | Variable | Purpose |
 |---|---|
@@ -117,57 +162,59 @@ All configuration is via environment variables (or `.env` - see
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | ChatGPT credentials/model. |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_TOKENS` | Claude credentials/model. |
 | `OLLAMA_HOST`, `OLLAMA_MODEL` | Local fallback server/model. |
-| `DEFAULT_COOLDOWN_SECONDS` | Initial cooldown when a provider is exhausted with no `Retry-After`. |
-| `MAX_COOLDOWN_SECONDS` | Cap on the exponential backoff. |
-| `BACKOFF_MULTIPLIER` | Growth factor applied to the cooldown each time a provider is still exhausted after its previous cooldown expired. |
-| `STATE_FILE` | Where cooldown state is persisted between restarts. Empty = memory-only. |
-| `HOST`, `PORT` | Server bind address. Defaults to `127.0.0.1` (this machine only). |
-| `BOT_SHARED_SECRET` | When set, `/chat` and `/status` require a matching `X-Bot-Secret` header. |
-| `LOG_LEVEL` | Python log level, default `INFO`. Failover and hand-back events are logged at `WARNING`/`INFO`. |
-| `PUBLIC_TUNNEL` | Windows `start.cmd` only: `yes` opens a Cloudflare tunnel on every start, `no` keeps the bot on this PC. Empty = ask once. |
+| `OLLAMA_NUM_CTX` | How many tokens of the conversation Ollama can see, default 8192 (llama3's maximum). |
+| `DEFAULT_COOLDOWN_SECONDS` | First cooldown when a provider is out of usage and sends no `Retry-After`. |
+| `MAX_COOLDOWN_SECONDS` | Cap on the growing cooldown. |
+| `BACKOFF_MULTIPLIER` | How much the cooldown grows each time a provider is still out of usage. |
+| `STATE_FILE` | Where cooldowns are saved between restarts. Empty = memory only. |
+| `CONVERSATIONS_DIR` | Where the chat page saves conversations. |
+| `HOST`, `PORT` | Server address. Defaults to `127.0.0.1:8080` (this PC only). |
+| `BOT_SHARED_SECRET` | When set, everything except the page itself and `/health` needs this key. |
+| `LOG_LEVEL` | Python log level, default `INFO`. Hand-overs and hand-backs are logged. |
+| `PUBLIC_TUNNEL` | Windows only: `yes` opens a Cloudflare tunnel on every start, `no` keeps the bot on this PC. Empty = ask once. |
+| `DESKTOP_SHORTCUT` | Windows only: `no` stops `start.cmd` from creating the desktop shortcut. |
 
-### Exposing it to Second Life
+If you make the bot reachable from other machines (`HOST=0.0.0.0`, a reverse
+proxy or the tunnel), keep `BOT_SHARED_SECRET` set. Otherwise anyone who
+finds the address can spend your API usage. The key travels in a request
+header, so use HTTPS for anything outside your own network (the Cloudflare
+tunnel does this for you).
 
-Second Life's servers have to reach this over the internet, so you'll need
-`HOST=0.0.0.0` (or a reverse proxy/tunnel in front of it). Before you do that,
-**set `BOT_SHARED_SECRET`** - otherwise anyone who finds the URL can spend
-your OpenAI/Anthropic usage through it. The secret travels in a request
-header, so put the server behind HTTPS if you can.
+## HTTP API
 
-## API
+- `GET /` - the chat page.
+- `GET /api/conversations`, `POST /api/conversations` (optionally with
+  `imported_text` and `source` to continue a pasted chat),
+  `GET`/`DELETE /api/conversations/<id>`, and
+  `POST /api/conversations/<id>/messages` with `{"content": "..."}`.
+- `POST /v1/chat/completions`, `GET /v1/models` - OpenAI-compatible (above).
+- `POST /chat` with `{"message": "...", "history": [...]}` returns
+  `{"reply", "provider", "handover"}`; `handover` is `true` when Ollama
+  answered. This is what the Second Life script uses.
+- `GET /status` - each provider's model, whether it's available or how long
+  until its cooldown ends, and which one answers next.
+- `GET /health` - liveness check.
 
-**`POST /chat`**
-```jsonc
-// request
-{ "message": "hello", "history": [{"role": "user", "content": "..."}] }
-// response
-{ "reply": "hi!", "provider": "ollama", "handover": true }
-```
-`provider` says who actually answered; `handover` is `true` whenever the
-answer came from the Ollama fallback instead of a primary provider. Returns
-`503` if every provider (including Ollama) failed - the details go to the
-server log rather than the response - and `401` if `BOT_SHARED_SECRET` is set
-and the `X-Bot-Secret` header doesn't match.
+The key goes in an `X-Bot-Secret` header, or `Authorization: Bearer <key>`
+for OpenAI-compatible clients. `503` means nothing could answer (the details
+go to the bot's log, not the response); `401` means the key is missing or
+wrong.
 
-**`GET /status`** - which provider is currently active, and for each primary
-provider whether it's available or how many seconds until its cooldown ends.
+## Second Life (optional)
 
-**`GET /health`** - liveness check.
+[`scripts/chatbot.lsl`](scripts/chatbot.lsl) is an in-world chat script: the
+object's owner says `bot <anything>` in local chat and the reply is said back.
+Second Life can only reach the bot through a public address, so answer yes to
+the tunnel question (or set `PUBLIC_TUNNEL=yes`). `start.cmd` then fills in the
+script's `BOT_URL` and `BOT_SECRET`, saves it as `data\chatbot.lsl` and copies
+it to your clipboard. The tunnel address changes each time the bot starts, so
+paste the script into your object again after a restart.
 
-### Calling it from an LSL script
-
-LSL objects can only reach the outside world over HTTP (`llHTTPRequest`).
-[`scripts/chatbot.lsl`](scripts/chatbot.lsl) is a complete in-world chat
-script: the object's owner says `bot <anything>` in local chat and the reply
-is said back. On Windows, `start.cmd` fills in its `BOT_URL` and `BOT_SECRET`
-for you; elsewhere, replace those two placeholders yourself.
-
-It also handles a few things that are easy to miss in your own scripts:
+The script also handles a few things that are easy to miss:
 
 - the secret goes in an `X-Bot-Secret` header (`HTTP_CUSTOM_HEADER`);
 - `HTTP_BODY_MAXLENGTH` is raised to 16384, because LSL truncates responses at
-  2048 bytes by default, cutting a longer reply's JSON in half so
-  `llJsonGetValue` can't parse it;
+  2048 bytes by default, cutting a longer reply's JSON in half;
 - long replies are split up, because `llSay` cuts a message off at 1024 bytes;
 - it only listens to the owner, so other people can't spend your API usage.
 
@@ -181,10 +228,11 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-`tests/test_router.py` covers the failover/hand-back/backoff/persistence
-logic with scripted fake providers and a fake clock (no real network or
-sleeping involved), plus concurrency: a slow provider call must not hold up
-other requests, and a burst of simultaneous 429s must start one cooldown, not
-escalate it once per request. `tests/test_providers.py` checks that real
-OpenAI/Anthropic SDK exceptions get translated correctly. `tests/test_server.py`
-covers the HTTP routes and the shared-secret check with a stubbed router.
+- `tests/test_router.py`: failover, hand-back, backoff, persistence and
+  concurrency, using scripted fake providers and a fake clock.
+- `tests/test_providers.py`: real OpenAI/Anthropic SDK errors are translated
+  correctly, and Ollama is asked for a big enough context window.
+- `tests/test_conversations.py`: conversation storage, including rejecting
+  ids that could escape the conversations folder.
+- `tests/test_server.py`: the HTTP routes, the key check, the chat page's API
+  and the OpenAI-compatible API.

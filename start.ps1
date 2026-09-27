@@ -167,12 +167,12 @@ function Get-TunnelChoice {
     if ($choice -eq 'yes' -or $choice -eq 'no') {
         return ($choice -eq 'yes')
     }
-    Write-Step 'Reaching the bot from Second Life'
-    Write-Host 'Second Life can only reach the bot through a public web address. A free Cloudflare'
-    Write-Host 'tunnel provides one without any router changes. Every request still needs the bot''s'
-    Write-Host 'secret, which only your Second Life script has.'
-    $answer = Read-Host 'Open a Cloudflare tunnel each time the bot starts? [Y/n]'
-    $yes = $answer -notmatch '^\s*n'
+    Write-Step 'Using the bot from outside this PC (optional)'
+    Write-Host 'Only needed for Second Life, or to use the chat page from another device such as your phone.'
+    Write-Host 'A free Cloudflare tunnel gives the bot a public web address without any router changes;'
+    Write-Host 'every request still needs the bot''s secret key.'
+    $answer = Read-Host 'Open a Cloudflare tunnel each time the bot starts? [y/N]'
+    $yes = $answer -match '^\s*y'
     Set-EnvValue $EnvFile 'PUBLIC_TUNNEL' $(if ($yes) { 'yes' } else { 'no' })
     return $yes
 }
@@ -355,6 +355,63 @@ function Write-LslScript([string]$Url, [string]$Secret) {
     return $path
 }
 
+function Get-Port {
+    $port = Get-EnvValue $EnvFile 'PORT'
+    if ($port) {
+        return $port
+    }
+    return '8080'
+}
+
+function Open-ChatPage([string]$Port) {
+    # The key rides in the #fragment, which browsers never send to the server;
+    # the page saves it and then wipes it from the address bar.
+    $key = [uri]::EscapeDataString((Get-EnvValue $EnvFile 'BOT_SHARED_SECRET'))
+    Start-Process "http://127.0.0.1:$Port/#key=$key"
+}
+
+function Install-DesktopShortcut {
+    if ((Get-EnvValue $EnvFile 'DESKTOP_SHORTCUT') -eq 'no') {
+        return
+    }
+    # A convenience only: failing to make it must never stop the bot starting.
+    try {
+        $path = Join-Path ([Environment]::GetFolderPath('Desktop')) 'lsl-bot.lnk'
+        if (Test-Path -LiteralPath $path) {
+            return
+        }
+        $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+        $shortcut.TargetPath = Join-Path $Root 'start.cmd'
+        $shortcut.WorkingDirectory = $Root
+        $shortcut.IconLocation = (Join-Path $Root 'assets\lsl-bot.ico') + ',0'
+        $shortcut.Description = 'Start lsl-bot and open its chat page'
+        $shortcut.Save()
+        Write-Host 'Added an lsl-bot shortcut to your desktop.'
+    } catch {
+        Write-Host "Couldn't add a desktop shortcut ($($_.Exception.Message)). start.cmd still works."
+    }
+}
+
+function Start-Server([string]$Port) {
+    $server = Start-Process -FilePath $VenvPython -ArgumentList "`"$(Join-Path $Root 'run_server.py')`"" `
+        -WorkingDirectory $Root -NoNewWindow -PassThru
+    # Without touching Handle first, Windows PowerShell can lose the exit code.
+    $null = $server.Handle
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not $server.HasExited -and (Get-Date) -lt $deadline) {
+        if (Test-Url "http://127.0.0.1:$Port/health") {
+            Open-ChatPage $Port
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    $server.WaitForExit()
+    # 0xC000013A is how Windows reports a program stopped with Ctrl+C.
+    if ($server.ExitCode -ne 0 -and $server.ExitCode -ne -1073741510) {
+        throw "The bot stopped with an error (exit code $($server.ExitCode)). See the messages above."
+    }
+}
+
 try {
     Set-Location -LiteralPath $Root
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -362,16 +419,23 @@ try {
     # Pick up tools an earlier run installed, even if this window predates them.
     Update-SessionPath
 
-    Write-Host 'lsl-bot: the first run downloads Python, Ollama and a several-GB model, so it takes a while.'
+    if (-not (Test-Path -LiteralPath $VenvPython)) {
+        Write-Host 'lsl-bot: the first run downloads Python, Ollama and a several-GB model, so it takes a while.'
+    }
     Initialize-EnvFile
+    Install-DesktopShortcut
+
+    $port = Get-Port
+    if (Test-Url "http://127.0.0.1:$port/health") {
+        Write-Host 'lsl-bot is already running, so this just opens the chat page.'
+        Open-ChatPage $port
+        exit 0
+    }
+
     $usePublic = Get-TunnelChoice
     Initialize-Python
     Initialize-Ollama
 
-    $port = Get-EnvValue $EnvFile 'PORT'
-    if (-not $port) {
-        $port = '8080'
-    }
     $tunnel = $null
     try {
         $lslPath = ''
@@ -380,22 +444,19 @@ try {
             $lslPath = Write-LslScript "$($tunnel.Url)/chat" (Get-EnvValue $EnvFile 'BOT_SHARED_SECRET')
         }
 
-        Write-Step 'lsl-bot is starting'
+        Write-Step 'lsl-bot is running'
+        Write-Host "Chat page:  http://127.0.0.1:$port (opening in your browser)"
+        Write-Host "Other apps: use http://127.0.0.1:$port/v1 as their OpenAI API address, and BOT_SHARED_SECRET"
+        Write-Host '            from the .env file in this folder as their API key.'
         if ($tunnel) {
-            Write-Host "Public address:     $($tunnel.Url)/chat"
-            Write-Host "Second Life script: $lslPath (also copied to your clipboard)"
-            Write-Host 'In Second Life, open an object''s Contents, create a New Script, replace all of its'
-            Write-Host 'text with the clipboard and save. Then say "bot hello" in local chat.'
-            Write-Host 'The public address changes each time the bot starts, so paste the script again after a restart.'
-        } else {
-            Write-Host "Running on http://127.0.0.1:$port (this PC only)."
-            Write-Host 'To reach it from Second Life, set PUBLIC_TUNNEL=yes in .env and run start.cmd again.'
+            Write-Host "Public:     $($tunnel.Url) (for Second Life, or the chat page on another device)"
+            Write-Host "Second Life script: $lslPath (also copied to your clipboard). The public address"
+            Write-Host 'changes each time the bot starts, so paste the script into your object again after a restart.'
         }
-        Write-Host 'Press Ctrl+C to stop.'
+        Write-Host 'Keep this window open while you use the bot. Press Ctrl+C or close it to stop.'
         Write-Host ''
 
-        & $VenvPython (Join-Path $Root 'run_server.py')
-        Assert-ExitCode 'running the bot'
+        Start-Server $port
     } finally {
         if ($tunnel -and -not $tunnel.Process.HasExited) {
             Stop-Process -Id $tunnel.Process.Id -Force -ErrorAction SilentlyContinue

@@ -241,20 +241,28 @@ function Test-OllamaModel([string]$BaseUrl, [string]$Model) {
     return $false
 }
 
-function Initialize-Ollama {
-    $baseUrl = (Get-EnvValue $EnvFile 'OLLAMA_HOST').TrimEnd('/')
-    if (-not $baseUrl -or $baseUrl -eq 'http://localhost:11434') {
-        # Earlier versions wrote "localhost", which Windows may try over IPv6
-        # first and stall on; Ollama itself listens on 127.0.0.1.
-        $baseUrl = 'http://127.0.0.1:11434'
-        Set-EnvValue $EnvFile 'OLLAMA_HOST' $baseUrl
+function Get-OllamaUrl {
+    # Asks the bot's own code, so this sets up the Ollama the bot will use: an
+    # OLLAMA_HOST set in Windows wins over .env, and 0.0.0.0 means this PC.
+    try {
+        $url = @(& $VenvPython -m lslbot.ollama_host)
+        if ($LASTEXITCODE -eq 0 -and $url.Count -gt 0 -and $url[-1]) {
+            return ([string]$url[-1]).Trim()
+        }
+    } catch {
+        # Fall back to where Ollama listens unless told otherwise.
     }
+    return 'http://127.0.0.1:11434'
+}
+
+function Initialize-Ollama {
+    $baseUrl = Get-OllamaUrl
     $model = Get-EnvValue $EnvFile 'OLLAMA_MODEL'
     if (-not $model) {
         $model = 'llama3'
     }
 
-    if ($baseUrl -notmatch '^http://(localhost|127\.0\.0\.1):11434$') {
+    if ($baseUrl -ne 'http://127.0.0.1:11434') {
         Write-Host "OLLAMA_HOST is $baseUrl, so this script leaves Ollama for you to run there."
         return
     }

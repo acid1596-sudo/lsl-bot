@@ -320,3 +320,36 @@ def test_ollama_health(monkeypatch):
 def test_ollama_defaults_to_the_ipv4_loopback():
     # On Windows "localhost" can try IPv6 first and stall before falling back.
     assert OllamaProvider().host == "http://127.0.0.1:11434"
+
+
+def test_ollama_host_written_for_the_ollama_server_still_reaches_it(monkeypatch):
+    # OLLAMA_HOST=0.0.0.0:11434 tells Ollama to listen on every network; the
+    # bot used to send that straight to requests, which can't connect to it.
+    posted = []
+
+    def fake_post(url, json=None, timeout=None):
+        posted.append(url)
+        return _Resp(200, {"message": {"content": "ok"}})
+
+    monkeypatch.setattr("lslbot.providers.ollama_provider.requests.post", fake_post)
+    assert OllamaProvider(host="0.0.0.0:11434").generate([]) == "ok"
+    assert posted == ["http://127.0.0.1:11434/api/chat"]
+
+
+def test_ollama_host_that_is_not_an_address_says_so():
+    provider = OllamaProvider(host="tcp://myserver:11434")
+
+    with pytest.raises(ProviderError) as exc_info:
+        provider.generate([])
+    assert str(exc_info.value) == "tcp://myserver:11434 isn't an address the bot can use - check OLLAMA_HOST"
+    assert provider.health() == {
+        "available": False,
+        "problem": "tcp://myserver:11434 isn't an address the bot can use - check OLLAMA_HOST",
+    }
+
+
+def test_ollama_health_survives_a_reply_that_is_not_ollamas(monkeypatch):
+    monkeypatch.setattr(
+        "lslbot.providers.ollama_provider.requests.get", lambda *a, **kw: _Resp(200, {"models": 5})
+    )
+    assert OllamaProvider().health()["available"] is False

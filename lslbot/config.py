@@ -1,6 +1,7 @@
 import os
 from typing import List
 
+from .ollama_host import configured_url
 from .providers import AnthropicProvider, OllamaProvider, OpenAIProvider, Provider
 from .router import FailoverRouter
 
@@ -34,7 +35,7 @@ def build_router_from_env() -> FailoverRouter:
         primaries.append(factory())
 
     fallback = OllamaProvider(
-        host=os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434",
+        host=configured_url(),
         model=os.environ.get("OLLAMA_MODEL") or "llama3",
         num_ctx=int(os.environ.get("OLLAMA_NUM_CTX") or 8192),
         timeout=float(os.environ.get("OLLAMA_TIMEOUT") or 600),

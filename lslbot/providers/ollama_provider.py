@@ -2,6 +2,7 @@ from typing import List
 
 import requests
 
+from ..ollama_host import DEFAULT_URL, ollama_url
 from .base import Message, Provider, ProviderError
 
 
@@ -22,12 +23,12 @@ class OllamaProvider(Provider):
 
     def __init__(
         self,
-        host: str = "http://127.0.0.1:11434",
+        host: str = DEFAULT_URL,
         model: str = "llama3",
         num_ctx: int = 8192,
         timeout: float = 600.0,
     ):
-        self.host = host.rstrip("/")
+        self.host = ollama_url(host)
         self.model = model
         self.num_ctx = num_ctx
         self.timeout = timeout
@@ -55,6 +56,8 @@ class OllamaProvider(Provider):
             ) from exc
         except requests.ConnectionError as exc:
             raise ProviderError(f"Ollama isn't reachable at {self.host}") from exc
+        except (requests.exceptions.InvalidSchema, requests.exceptions.InvalidURL) as exc:
+            raise ProviderError(f"{self.host} isn't an address the bot can use - check OLLAMA_HOST") from exc
         except requests.RequestException as exc:
             raise ProviderError(f"Ollama request failed: {exc}") from exc
 
@@ -71,7 +74,9 @@ class OllamaProvider(Provider):
             response = requests.get(f"{self.host}/api/tags", timeout=3)
             response.raise_for_status()
             installed = {m.get("name") for m in response.json().get("models") or [] if isinstance(m, dict)}
-        except (requests.RequestException, ValueError, AttributeError):
+        except (requests.exceptions.InvalidSchema, requests.exceptions.InvalidURL):
+            return {"available": False, "problem": f"{self.host} isn't an address the bot can use - check OLLAMA_HOST"}
+        except (requests.RequestException, ValueError, AttributeError, TypeError):
             return {"available": False, "problem": f"Ollama isn't reachable at {self.host}"}
         wanted = self.model if ":" in self.model else f"{self.model}:latest"
         if wanted not in installed:

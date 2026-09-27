@@ -156,6 +156,7 @@ ones:
 | The page says | What to do |
 |---|---|
 | Ollama isn't reachable at http://127.0.0.1:11434 | Open the Ollama app from the Start menu (it runs in the system tray), then try again. |
+| ... isn't an address the bot can use - check OLLAMA_HOST | Fix `OLLAMA_HOST` in `.env`, or in Windows' environment variables if you set it there for Ollama. Forms like `0.0.0.0:11434` and `http://host:11434` both work. |
 | Ollama doesn't have the model 'llama3' yet | Run `ollama pull llama3` in PowerShell, or run `start.cmd` again. |
 | Ollama said: ... requires more system memory ... | Set `OLLAMA_NUM_CTX=4096` in `.env` (or try a smaller model), then restart the bot. |
 | Ollama took longer than 600s to answer | Your PC is running the model slowly; raise `OLLAMA_TIMEOUT` in `.env`, or use a smaller model. |
@@ -200,7 +201,7 @@ for the full list with defaults):
 | `PRIMARY_PROVIDERS` | Comma-separated priority chain, e.g. `openai,anthropic`. Each must be `openai` or `anthropic`. |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | ChatGPT credentials/model. |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_TOKENS` | Claude credentials/model. |
-| `OLLAMA_HOST`, `OLLAMA_MODEL` | Local fallback server and model. Default `http://127.0.0.1:11434` and `llama3`. |
+| `OLLAMA_HOST`, `OLLAMA_MODEL` | Local fallback server and model. Default `http://127.0.0.1:11434` and `llama3`. `OLLAMA_HOST` is Ollama's own setting too: if it's set in Windows (say `0.0.0.0:11434`, to share Ollama on your network), that wins over `.env`, and the bot reads it the way Ollama does, so `0.0.0.0` means this PC. |
 | `OLLAMA_NUM_CTX` | How many tokens of the conversation Ollama can see, default 8192 (llama3's maximum). Lower it if Ollama runs out of memory. |
 | `OLLAMA_TIMEOUT` | Seconds to wait for Ollama's reply, default 600. |
 | `DEFAULT_COOLDOWN_SECONDS` | First cooldown when a provider is out of usage and sends no `Retry-After`. |

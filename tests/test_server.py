@@ -1,0 +1,553 @@
+import sys
+
+import pytest
+
+from lslbot.router import RouterError, RouterResult
+
+
+def _import_server(monkeypatch, tmp_path, shared_secret=None):
+    # Run from an empty directory so a developer's real .env can't leak in.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PRIMARY_PROVIDERS", "openai")
+    monkeypatch.setenv("STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("CONVERSATIONS_DIR", str(tmp_path / "conversations"))
+    monkeypatch.setenv("TASKS_FILE", str(tmp_path / "tasks.json"))
+    if shared_secret is None:
+        monkeypatch.delenv("BOT_SHARED_SECRET", raising=False)
+    else:
+        monkeypatch.setenv("BOT_SHARED_SECRET", shared_secret)
+
+    sys.modules.pop("lslbot.server", None)
+    sys.modules.pop("lslbot.config", None)
+    import lslbot.server as server
+
+    return server
+
+
+@pytest.fixture
+def app_module(monkeypatch, tmp_path):
+    return _import_server(monkeypatch, tmp_path)
+
+
+@pytest.fixture
+def secured_app_module(monkeypatch, tmp_path):
+    server = _import_server(monkeypatch, tmp_path, shared_secret="s3cret")
+    server.router = StubRouter(
+        result=RouterResult(text="reply", provider="openai", handover=False, attempts=[])
+    )
+    return server
+
+
+class StubFallback:
+    name = "ollama"
+    model = "llama3"
+
+    def __init__(self, installed=None):
+        self.installed = installed
+
+    def installed_models(self):
+        return self.installed
+
+
+class StubRouter:
+    def __init__(self, result=None, error=None, installed=None):
+        self._result = result
+        self._error = error
+        self.fallback = StubFallback(installed)
+        self.messages_seen = None
+        self.only_seen = "not called"
+        self.models_seen = None
+        self.status_models_seen = None
+
+    def provider_names(self):
+        return ["openai", "ollama"]
+
+    def generate(self, messages, only=None, models=None):
+        self.messages_seen = messages
+        self.only_seen = only
+        self.models_seen = models
+        if self._error:
+            raise self._error
+        return self._result
+
+    def status(self, models=None):
+        self.status_models_seen = models
+        return {"active_provider": "ollama", "providers": {}}
+
+
+def test_chat_endpoint_returns_router_result(app_module):
+    app_module.router = StubRouter(
+        result=RouterResult(text="stub reply", provider="ollama", handover=True, attempts=["x"])
+    )
+    client = app_module.app.test_client()
+
+    resp = client.post("/chat", json={"message": "hello"})
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"reply": "stub reply", "provider": "ollama", "handover": True}
+    assert app_module.router.messages_seen == [{"role": "user", "content": "hello"}]
+
+
+def test_chat_endpoint_includes_history(app_module):
+    app_module.router = StubRouter(
+        result=RouterResult(text="reply", provider="openai", handover=False, attempts=[])
+    )
+    client = app_module.app.test_client()
+
+    history = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "ok"}]
+    client.post("/chat", json={"message": "hello", "history": history})
+
+    assert app_module.router.messages_seen == history + [{"role": "user", "content": "hello"}]
+
+
+def test_chat_endpoint_requires_message(app_module):
+    client = app_module.app.test_client()
+    resp = client.post("/chat", json={})
+    assert resp.status_code == 400
+
+
+def test_chat_endpoint_returns_503_on_router_error(app_module):
+    app_module.router = StubRouter(error=RouterError("everything is down", reason="fallback", provider="ollama", fallback_error="Ollama isn't reachable"))
+    client = app_module.app.test_client()
+
+    resp = client.post("/chat", json={"message": "hi"})
+
+    assert resp.status_code == 503
+    assert "error" in resp.get_json()
+
+
+def test_status_endpoint(app_module):
+    app_module.router = StubRouter()
+    client = app_module.app.test_client()
+
+    resp = client.get("/status")
+
+    assert resp.status_code == 200
+    assert resp.get_json()["active_provider"] == "ollama"
+
+
+def test_health_endpoint(app_module):
+    client = app_module.app.test_client()
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True}
+
+
+def test_chat_rejects_missing_secret_when_one_is_configured(secured_app_module):
+    client = secured_app_module.app.test_client()
+    resp = client.post("/chat", json={"message": "hi"})
+    assert resp.status_code == 401
+
+
+def test_chat_rejects_wrong_secret(secured_app_module):
+    client = secured_app_module.app.test_client()
+    resp = client.post("/chat", json={"message": "hi"}, headers={"X-Bot-Secret": "guess"})
+    assert resp.status_code == 401
+
+
+def test_chat_accepts_correct_secret(secured_app_module):
+    client = secured_app_module.app.test_client()
+    resp = client.post("/chat", json={"message": "hi"}, headers={"X-Bot-Secret": "s3cret"})
+    assert resp.status_code == 200
+    assert resp.get_json()["reply"] == "reply"
+
+
+def test_status_requires_secret_too(secured_app_module):
+    client = secured_app_module.app.test_client()
+    assert client.get("/status").status_code == 401
+    assert client.get("/status", headers={"X-Bot-Secret": "s3cret"}).status_code == 200
+
+
+def test_health_stays_open_for_liveness_checks(secured_app_module):
+    client = secured_app_module.app.test_client()
+    assert client.get("/health").status_code == 200
+
+
+# --- chat page and its conversation API -------------------------------------
+
+def test_chat_page_is_served_without_the_secret(secured_app_module):
+    client = secured_app_module.app.test_client()
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert b"<html" in resp.data.lower()
+    assert "script-src 'self'" in resp.headers["Content-Security-Policy"]
+
+
+def test_conversation_api_requires_the_secret(secured_app_module):
+    client = secured_app_module.app.test_client()
+    assert client.get("/api/conversations").status_code == 401
+    assert client.get("/api/conversations", headers={"X-Bot-Secret": "s3cret"}).status_code == 200
+
+
+def test_sending_a_message_uses_the_whole_conversation(app_module):
+    app_module.router = StubRouter(
+        result=RouterResult(text="first answer", provider="openai", handover=False, attempts=[])
+    )
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    first = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hello"})
+    assert first.status_code == 200
+    assert app_module.router.messages_seen == [{"role": "user", "content": "hello"}]
+
+    app_module.router = StubRouter(
+        result=RouterResult(text="second answer", provider="ollama", handover=True, attempts=[])
+    )
+    second = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "and then?"})
+    body = second.get_json()
+
+    assert app_module.router.messages_seen == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "and then?"},
+    ]
+    assert body["handover"] is True
+    assert [m.get("provider") for m in body["conversation"]["messages"]] == [None, "openai", None, "ollama"]
+    assert body["conversation"]["title"] == "hello"
+
+
+def test_imported_chat_is_sent_as_context(app_module):
+    app_module.router = StubRouter(result=RouterResult(text="ok", provider="ollama", handover=True, attempts=[]))
+    client = app_module.app.test_client()
+    conversation = client.post(
+        "/api/conversations", json={"imported_text": "You: help me write a CV", "source": "Claude"}
+    ).get_json()
+
+    client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "continue"})
+
+    context, question = app_module.router.messages_seen
+    assert context["role"] == "system" and "help me write a CV" in context["content"]
+    assert question == {"role": "user", "content": "continue"}
+
+
+def test_failed_reply_stores_nothing_so_it_can_be_retried(app_module):
+    app_module.router = StubRouter(error=RouterError("all down", reason="fallback", provider="ollama", fallback_error="Ollama isn't reachable"))
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    resp = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hi"})
+
+    assert resp.status_code == 503
+    stored = client.get(f"/api/conversations/{conversation['id']}").get_json()
+    assert stored["messages"] == []
+
+
+def test_unknown_or_malformed_conversation_ids_are_404(app_module):
+    client = app_module.app.test_client()
+    for bad_id in ["0" * 32, "..%2F..%2Fstate", "not-an-id"]:
+        assert client.get(f"/api/conversations/{bad_id}").status_code == 404
+        assert client.delete(f"/api/conversations/{bad_id}").status_code == 404
+        assert client.post(f"/api/conversations/{bad_id}/messages", json={"content": "x"}).status_code == 404
+
+
+def test_list_and_delete_conversations(app_module):
+    client = app_module.app.test_client()
+    a = client.post("/api/conversations", json={}).get_json()
+    b = client.post("/api/conversations", json={}).get_json()
+    assert {c["id"] for c in client.get("/api/conversations").get_json()} == {a["id"], b["id"]}
+
+    assert client.delete(f"/api/conversations/{a['id']}").status_code == 204
+    assert [c["id"] for c in client.get("/api/conversations").get_json()] == [b["id"]]
+
+
+# --- OpenAI-compatible API ----------------------------------------------------
+
+def test_openai_compatible_chat_completion(app_module):
+    app_module.router = StubRouter(result=RouterResult(text="hi there", provider="ollama", handover=True, attempts=[]))
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "developer", "content": "be brief"},
+                {"role": "user", "content": [{"type": "text", "text": "hel"}, {"type": "text", "text": "lo"}]},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+                {"role": "tool", "content": "tool output", "tool_call_id": "1"},
+            ],
+        },
+    )
+
+    body = resp.get_json()
+    assert resp.status_code == 200
+    assert body["object"] == "chat.completion"
+    assert body["model"] == "lslbot/ollama"
+    assert body["choices"][0]["message"] == {"role": "assistant", "content": "hi there"}
+    assert app_module.router.messages_seen == [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "hello"},
+    ]
+
+
+def test_openai_compatible_streaming(app_module):
+    app_module.router = StubRouter(result=RouterResult(text="streamed", provider="openai", handover=False, attempts=[]))
+    client = app_module.app.test_client()
+
+    resp = client.post("/v1/chat/completions", json={"stream": True, "messages": [{"role": "user", "content": "hi"}]})
+
+    assert resp.mimetype == "text/event-stream"
+    events = [line[len("data: "):] for line in resp.get_data(as_text=True).splitlines() if line.startswith("data: ")]
+    assert events[-1] == "[DONE]"
+    import json as _json
+    first = _json.loads(events[0])
+    assert first["choices"][0]["delta"] == {"role": "assistant", "content": "streamed"}
+    assert _json.loads(events[1])["choices"][0]["finish_reason"] == "stop"
+
+
+def test_openai_compatible_errors(app_module):
+    client = app_module.app.test_client()
+    bad = client.post("/v1/chat/completions", json={"messages": []})
+    assert bad.status_code == 400 and bad.get_json()["error"]["type"] == "invalid_request_error"
+
+    app_module.router = StubRouter(error=RouterError("all down", reason="fallback", provider="ollama", fallback_error="Ollama isn't reachable"))
+    down = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert down.status_code == 503 and "all down" not in down.get_data(as_text=True)
+
+
+def test_openai_clients_authenticate_with_a_bearer_key(secured_app_module):
+    client = secured_app_module.app.test_client()
+    assert client.get("/v1/models").status_code == 401
+    assert client.get("/v1/models", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    ok = client.get("/v1/models", headers={"Authorization": "Bearer s3cret"})
+    assert ok.status_code == 200 and ok.get_json()["data"][0]["id"] == "lslbot"
+
+
+# --- choosing who answers, and explaining failures ----------------------------
+
+def test_answer_with_ollama_sends_only_to_ollama(app_module):
+    app_module.router = StubRouter(result=RouterResult(text="local", provider="ollama", handover=True, attempts=[]))
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    resp = client.post(
+        f"/api/conversations/{conversation['id']}/messages", json={"content": "hi", "provider": "ollama"}
+    )
+
+    assert resp.status_code == 200
+    assert app_module.router.only_seen == "ollama"
+
+
+def test_auto_means_the_usual_failover(app_module):
+    app_module.router = StubRouter(result=RouterResult(text="x", provider="openai", handover=False, attempts=[]))
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hi", "provider": "auto"})
+
+    assert app_module.router.only_seen is None
+
+
+def test_unknown_provider_choice_is_rejected(app_module):
+    app_module.router = StubRouter(result=RouterResult(text="x", provider="openai", handover=False, attempts=[]))
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    resp = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hi", "provider": "gemini"})
+
+    assert resp.status_code == 400
+    assert app_module.router.only_seen == "not called"
+
+
+def test_failure_explains_what_ollama_said(app_module):
+    app_module.router = StubRouter(
+        error=RouterError(
+            "x", reason="fallback", provider="ollama",
+            fallback_error="Ollama said: model requires more system memory (5.6 GiB) than is available (3.1 GiB)",
+        )
+    )
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    body = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hi"}).get_json()
+
+    assert "Ollama couldn't answer" in body["detail"]
+    assert "more system memory" in body["detail"]
+
+
+def test_cloud_error_text_is_never_shown(app_module):
+    app_module.router = StubRouter(
+        error=RouterError("openai failed: Incorrect API key provided: sk-abc***xyz", reason="error", provider="openai")
+    )
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    resp = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hi", "provider": "openai"})
+
+    assert resp.status_code == 503
+    assert "sk-abc" not in resp.get_data(as_text=True)
+    assert "ChatGPT couldn't answer" in resp.get_json()["detail"]
+
+
+def test_openai_clients_pick_a_provider_by_model_name(app_module):
+    app_module.router = StubRouter(result=RouterResult(text="x", provider="ollama", handover=True, attempts=[]))
+    client = app_module.app.test_client()
+    messages = [{"role": "user", "content": "hi"}]
+
+    client.post("/v1/chat/completions", json={"model": "lslbot/ollama", "messages": messages})
+    assert app_module.router.only_seen == "ollama"
+    client.post("/v1/chat/completions", json={"model": "gpt-4o", "messages": messages})
+    assert app_module.router.only_seen is None
+
+    ids = [m["id"] for m in client.get("/v1/models").get_json()["data"]]
+    assert ids == ["lslbot", "lslbot/openai", "lslbot/ollama", "lslbot@mesh", "lslbot@lsl", "lslbot@code"]
+
+
+# --- tasks: instructions and the Ollama model for each kind of work ---------
+
+CODERS = [{"name": "llama3:latest", "size": 4}, {"name": "qwen3-coder:30b", "size": 18}]
+
+
+def _ok(provider="ollama", model="qwen3-coder:30b"):
+    return RouterResult(text="done", provider=provider, handover=provider == "ollama", attempts=[], model=model)
+
+
+def test_tasks_list_their_automatic_models(app_module):
+    app_module.router = StubRouter(installed=CODERS)
+    body = app_module.app.test_client().get("/api/tasks").get_json()
+
+    tasks = {t["id"]: t for t in body["tasks"]}
+    assert list(tasks) == ["general", "mesh", "lsl", "code"]
+    assert tasks["general"]["model"] == "llama3"
+    assert tasks["mesh"] == {
+        "id": "mesh",
+        "label": "Mesh for Second Life",
+        "description": tasks["mesh"]["description"],
+        "chosen_model": "",
+        "automatic_model": "qwen3-coder:30b",
+        "model": "qwen3-coder:30b",
+    }
+    assert body["installed_models"] == ["llama3:latest", "qwen3-coder:30b"]
+
+
+def test_tasks_say_when_ollama_cant_list_its_models(app_module):
+    app_module.router = StubRouter(installed=None)
+    body = app_module.app.test_client().get("/api/tasks").get_json()
+    assert body["installed_models"] is None
+    assert {t["model"] for t in body["tasks"]} == {"llama3"}
+
+
+def test_picking_a_model_for_a_task_is_saved(app_module, tmp_path):
+    app_module.router = StubRouter(installed=CODERS)
+    client = app_module.app.test_client()
+
+    picked = client.put("/api/tasks/mesh", json={"model": "gpt-oss:20b"})
+    assert picked.status_code == 200 and picked.get_json()["model"] == "gpt-oss:20b"
+    assert '"mesh": "gpt-oss:20b"' in (tmp_path / "tasks.json").read_text()
+
+    back = client.put("/api/tasks/mesh", json={"model": ""}).get_json()
+    assert back["chosen_model"] == "" and back["model"] == "qwen3-coder:30b"
+
+    assert client.put("/api/tasks/mesh", json={"model": "no spaces allowed"}).status_code == 400
+    assert client.put("/api/tasks/mesh", json={"model": 42}).status_code == 400
+    assert client.put("/api/tasks/painting", json={"model": "llama3"}).status_code == 404
+
+
+def test_a_mesh_conversation_sends_its_instructions_and_ollama_model(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={"task": "mesh"}).get_json()
+    assert conversation["task"] == "mesh"
+
+    body = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "a bar stool"}).get_json()
+
+    instructions, question = app_module.router.messages_seen
+    assert instructions["role"] == "system" and "Blender Python script" in instructions["content"]
+    assert question == {"role": "user", "content": "a bar stool"}
+    assert app_module.router.models_seen == {"ollama": "qwen3-coder:30b"}
+    assert body["conversation"]["messages"][-1]["model"] == "qwen3-coder:30b"
+
+
+def test_a_picked_model_beats_the_automatic_one(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+    client.put("/api/tasks/lsl", json={"model": "gpt-oss:20b"})
+    conversation = client.post("/api/conversations", json={"task": "lsl"}).get_json()
+
+    client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "a door script"})
+
+    assert app_module.router.models_seen == {"ollama": "gpt-oss:20b"}
+
+
+def test_general_conversations_get_no_instructions_and_the_usual_model(app_module):
+    app_module.router = StubRouter(result=_ok(model="llama3"), installed=CODERS)
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hi"})
+
+    assert app_module.router.messages_seen == [{"role": "user", "content": "hi"}]
+    assert app_module.router.models_seen == {"ollama": "llama3"}
+
+
+def test_changing_a_conversations_task(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+
+    changed = client.patch(f"/api/conversations/{conversation['id']}", json={"task": "code"})
+    assert changed.status_code == 200 and changed.get_json()["task"] == "code"
+    client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "a backup script"})
+    assert "complete files" in app_module.router.messages_seen[0]["content"]
+
+    assert client.patch(f"/api/conversations/{conversation['id']}", json={"task": "painting"}).status_code == 400
+    assert client.patch(f"/api/conversations/{conversation['id']}", json={}).status_code == 400
+    assert client.patch(f"/api/conversations/{conversation['id']}", json=["task"]).status_code == 400
+    assert client.put("/api/tasks/mesh", json=["model"]).status_code == 400
+    assert client.put("/api/tasks/mesh", json={}).status_code == 400
+    assert client.patch(f"/api/conversations/{'0' * 32}", json={"task": "code"}).status_code == 404
+    assert client.post("/api/conversations", json={"task": "painting"}).status_code == 400
+
+
+def test_conversations_from_before_tasks_are_general(app_module):
+    app_module.router = StubRouter(result=_ok(model="llama3"), installed=CODERS)
+    client = app_module.app.test_client()
+    conversation = client.post("/api/conversations", json={}).get_json()
+    path = app_module.store._path(conversation["id"])
+    import json as _json
+    with open(path) as f:
+        stored = _json.load(f)
+    del stored["task"]
+    with open(path, "w") as f:
+        _json.dump(stored, f)
+
+    resp = client.post(f"/api/conversations/{conversation['id']}/messages", json={"content": "hi"})
+
+    assert resp.status_code == 200
+    assert app_module.router.messages_seen == [{"role": "user", "content": "hi"}]
+
+
+def test_status_checks_ollama_for_the_tasks_model(app_module):
+    app_module.router = StubRouter(installed=CODERS)
+    client = app_module.app.test_client()
+
+    client.get("/status?task=mesh")
+    assert app_module.router.status_models_seen == {"ollama": "qwen3-coder:30b"}
+    client.get("/status")
+    assert app_module.router.status_models_seen == {"ollama": "llama3"}
+    client.get("/status?task=painting")
+    assert app_module.router.status_models_seen == {"ollama": "llama3"}
+
+
+def test_openai_clients_pick_a_task_with_an_at_sign(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+    messages = [{"role": "user", "content": "a lamp"}]
+
+    client.post("/v1/chat/completions", json={"model": "lslbot/ollama@mesh", "messages": messages})
+    assert app_module.router.only_seen == "ollama"
+    assert app_module.router.models_seen == {"ollama": "qwen3-coder:30b"}
+    assert "Blender" in app_module.router.messages_seen[0]["content"]
+
+    client.post("/v1/chat/completions", json={"model": "lslbot@nonsense", "messages": messages})
+    assert app_module.router.only_seen is None and app_module.router.messages_seen == messages
+
+
+def test_second_life_chat_can_name_a_task(app_module):
+    app_module.router = StubRouter(result=_ok(), installed=CODERS)
+    client = app_module.app.test_client()
+
+    assert client.post("/chat", json={"message": "a door script", "task": "lsl"}).status_code == 200
+    assert "LSL" in app_module.router.messages_seen[0]["content"]
+    assert client.post("/chat", json={"message": "hi", "task": "painting"}).status_code == 400

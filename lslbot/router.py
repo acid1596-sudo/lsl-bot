@@ -119,16 +119,25 @@ class FailoverRouter:
                 remaining = self._cooldown_remaining(provider.name)
                 providers[provider.name] = {
                     "role": "primary",
+                    "model": getattr(provider, "model", None),
                     "available": remaining <= 0,
                     "retry_in_seconds": round(remaining, 1) if remaining > 0 else None,
                 }
-            providers[self._fallback.name] = {"role": "fallback", "available": True, "retry_in_seconds": None}
+            providers[self._fallback.name] = {
+                "role": "fallback",
+                "model": getattr(self._fallback, "model", None),
+                "available": True,
+                "retry_in_seconds": None,
+            }
 
             active = next(
                 (p.name for p in self._primary_providers if providers[p.name]["available"]),
                 self._fallback.name,
             )
-            return {"active_provider": active, "providers": providers}
+            # JSON objects are unordered (Flask even sorts their keys), so the
+            # priority order is spelled out separately.
+            order = [p.name for p in self._primary_providers] + [self._fallback.name]
+            return {"active_provider": active, "order": order, "providers": providers}
 
     def _cooldown_remaining(self, name: str) -> float:
         state = self._state.get(name)

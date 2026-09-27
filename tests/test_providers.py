@@ -228,3 +228,22 @@ def test_ollama_connection_failure_is_a_provider_error(monkeypatch):
 
     with pytest.raises(ProviderError):
         provider.generate([])
+
+
+def test_ollama_asks_for_a_context_window_big_enough_for_the_history(monkeypatch):
+    sent = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"message": {"content": "ok"}}
+
+    def fake_post(url, json=None, timeout=None):
+        sent.update(json)
+        return FakeResponse()
+
+    monkeypatch.setattr("lslbot.providers.ollama_provider.requests.post", fake_post)
+    OllamaProvider(num_ctx=16384).generate([{"role": "user", "content": "hi"}])
+    assert sent["options"] == {"num_ctx": 16384}

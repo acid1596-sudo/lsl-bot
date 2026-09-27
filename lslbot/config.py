@@ -36,6 +36,7 @@ def build_router_from_env() -> FailoverRouter:
     fallback = OllamaProvider(
         host=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
         model=os.environ.get("OLLAMA_MODEL", "llama3"),
+        num_ctx=int(os.environ.get("OLLAMA_NUM_CTX") or 8192),
     )
 
     state_file = os.environ.get("STATE_FILE", "./data/provider_state.json").strip()

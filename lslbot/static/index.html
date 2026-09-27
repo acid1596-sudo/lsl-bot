@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lsl-bot chat</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232f6fed'/%3E%3Cpath d='M8 11h16v9H14l-4 4v-4H8z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="sidebar" aria-label="Conversations">
+      <div class="brand">lsl-bot<small>ChatGPT and Claude, with Ollama as backup</small></div>
+      <div class="sidebar-actions">
+        <button class="primary" id="new-chat" type="button">New chat</button>
+        <button id="import-chat" type="button">Continue a ChatGPT/Claude chat</button>
+      </div>
+      <ul class="conversation-list" id="conversation-list"></ul>
+    </aside>
+
+    <main class="main">
+      <div class="status-bar" id="status-bar">
+        <button class="menu-toggle" id="menu-toggle" type="button">Chats</button>
+        <span class="status-note" id="status-note" aria-live="polite">Checking ChatGPT, Claude and Ollama...</span>
+      </div>
+
+      <div class="chat-header" id="chat-header" hidden>
+        <div class="chat-title" id="chat-title"></div>
+        <button id="copy-chat" type="button" title="Copy this conversation so you can paste it into ChatGPT or Claude">Copy chat</button>
+        <button id="delete-chat" type="button">Delete</button>
+      </div>
+
+      <section class="messages" id="messages" aria-live="polite"></section>
+
+      <div class="composer">
+        <p class="error" id="send-error" role="alert" hidden></p>
+        <form id="composer">
+          <textarea id="input" rows="1" placeholder="Message ChatGPT or Claude..." aria-label="Message"></textarea>
+          <button class="primary" id="send" type="submit">Send</button>
+        </form>
+        <p class="hint">Enter to send, Shift+Enter for a new line. If ChatGPT and Claude run out of usage, Ollama carries on with the same conversation and hands it back when they're available again.</p>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="import-dialog" aria-labelledby="import-heading">
+    <form id="import-form">
+      <h2 id="import-heading">Continue a ChatGPT or Claude chat</h2>
+      <p>In ChatGPT or Claude, select the whole conversation, copy it and paste it below. The task picks up from where it stopped.</p>
+      <label class="field">Where it came from
+        <select id="import-source">
+          <option>ChatGPT</option>
+          <option>Claude</option>
+          <option>Other</option>
+        </select>
+      </label>
+      <label class="field">Conversation
+        <textarea id="import-text" required placeholder="Paste the conversation here"></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" id="import-cancel">Cancel</button>
+        <button class="primary" type="submit">Continue here</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="key-dialog" aria-labelledby="key-heading">
+    <form id="key-form">
+      <h2 id="key-heading">Enter the bot's key</h2>
+      <p>It's the BOT_SHARED_SECRET value in the bot's .env file. start.cmd opens this page with it already filled in.</p>
+      <input id="key-input" type="password" autocomplete="off" required aria-label="Bot key">
+      <div class="dialog-actions">
+        <button class="primary" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status"></div>
+</body>
+</html>

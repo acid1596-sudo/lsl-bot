@@ -153,6 +153,13 @@ def test_backoff_is_capped_at_max_cooldown():
     assert router.status()["providers"]["openai"]["retry_in_seconds"] == pytest.approx(25.0)
 
 
+def test_status_lists_providers_in_priority_order():
+    router = make_router(
+        [FakeProvider("openai", []), FakeProvider("anthropic", [])], FakeProvider("ollama", []), FakeClock()
+    )
+    assert router.status()["order"] == ["openai", "anthropic", "ollama"]
+
+
 def test_falls_through_priority_chain_before_using_fallback():
     clock = FakeClock()
     primary_a = FakeProvider("openai", [UsageExhaustedError("out", retry_after=60.0)])

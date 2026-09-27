@@ -243,8 +243,11 @@ function Test-OllamaModel([string]$BaseUrl, [string]$Model) {
 
 function Initialize-Ollama {
     $baseUrl = (Get-EnvValue $EnvFile 'OLLAMA_HOST').TrimEnd('/')
-    if (-not $baseUrl) {
-        $baseUrl = 'http://localhost:11434'
+    if (-not $baseUrl -or $baseUrl -eq 'http://localhost:11434') {
+        # Earlier versions wrote "localhost", which Windows may try over IPv6
+        # first and stall on; Ollama itself listens on 127.0.0.1.
+        $baseUrl = 'http://127.0.0.1:11434'
+        Set-EnvValue $EnvFile 'OLLAMA_HOST' $baseUrl
     }
     $model = Get-EnvValue $EnvFile 'OLLAMA_MODEL'
     if (-not $model) {

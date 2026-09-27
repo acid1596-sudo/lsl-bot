@@ -82,6 +82,13 @@ Pasting the block again updates the bot and keeps your `.env`.
 - **Copy chat** copies the whole conversation, including what Ollama did, with
   a note asking the model to continue. Paste it into ChatGPT or Claude to hand
   the task back to them.
+- **Answer with** (above the message box) is normally **Auto**: the automatic
+  handover above. Choose **Ollama (on this PC) only** to pull a conversation to
+  Ollama yourself, even while ChatGPT and Claude are fine. Choose ChatGPT or
+  Claude to use just that one. Switch back to Auto to hand the task back.
+- The status bar checks Ollama too. If it shows **Ollama unavailable**, hover
+  over it, or read the note beside it, to see why (see
+  [If Ollama doesn't answer](#if-ollama-doesnt-answer)).
 
 Conversations are saved as files in `data\conversations` on your PC. The page
 asks for the bot's key if it doesn't have it; that's `BOT_SHARED_SECRET` in
@@ -93,7 +100,8 @@ Anything that lets you set a custom OpenAI API address can use the bot:
 
 - **API address / base URL:** `http://127.0.0.1:8080/v1`
 - **API key:** the `BOT_SHARED_SECRET` value from `.env`
-- **Model:** anything; the bot picks ChatGPT, Claude or Ollama itself.
+- **Model:** `lslbot` (or anything else) for the automatic handover, or
+  `lslbot/ollama`, `lslbot/openai`, `lslbot/anthropic` to use just that one.
 
 For example, with the official OpenAI Python library:
 
@@ -140,6 +148,37 @@ it just skips that provider for the current request. Requests run in
 parallel, and a burst of simultaneous 429s counts as one exhaustion rather
 than escalating the cooldown once per request.
 
+## If Ollama doesn't answer
+
+When nothing can answer, the chat page shows Ollama's own reason. The usual
+ones:
+
+| The page says | What to do |
+|---|---|
+| Ollama isn't reachable at http://127.0.0.1:11434 | Open the Ollama app from the Start menu (it runs in the system tray), then try again. |
+| Ollama doesn't have the model 'llama3' yet | Run `ollama pull llama3` in PowerShell, or run `start.cmd` again. |
+| Ollama said: ... requires more system memory ... | Set `OLLAMA_NUM_CTX=4096` in `.env` (or try a smaller model), then restart the bot. |
+| Ollama took longer than 600s to answer | Your PC is running the model slowly; raise `OLLAMA_TIMEOUT` in `.env`, or use a smaller model. |
+
+To test Ollama on its own, the same way the bot uses it, paste this into
+PowerShell:
+
+```powershell
+& {
+  $h = 'http://127.0.0.1:11434'; $model = 'llama3'
+  try {
+    $tags = Invoke-RestMethod "$h/api/tags" -TimeoutSec 5
+    'Ollama is reachable. Installed models: ' + ((@($tags.models) | ForEach-Object { $_.name }) -join ', ')
+  } catch { "Ollama is NOT reachable at ${h}: $($_.Exception.Message)"; return }
+  $body = @{ model = $model; stream = $false; options = @{ num_ctx = 8192 }; messages = @(@{ role = 'user'; content = 'Reply with the word hello.' }) } | ConvertTo-Json -Depth 5
+  $timer = [Diagnostics.Stopwatch]::StartNew()
+  try {
+    $reply = Invoke-RestMethod "$h/api/chat" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 900
+    "Ollama answered in $([int]$timer.Elapsed.TotalSeconds)s: $($reply.message.content)"
+  } catch { "Ollama failed after $([int]$timer.Elapsed.TotalSeconds)s: $($_.Exception.Message) $($_.ErrorDetails.Message)" }
+}
+```
+
 ## Setup on other systems
 
 ```bash
@@ -161,8 +200,9 @@ for the full list with defaults):
 | `PRIMARY_PROVIDERS` | Comma-separated priority chain, e.g. `openai,anthropic`. Each must be `openai` or `anthropic`. |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | ChatGPT credentials/model. |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_TOKENS` | Claude credentials/model. |
-| `OLLAMA_HOST`, `OLLAMA_MODEL` | Local fallback server/model. |
-| `OLLAMA_NUM_CTX` | How many tokens of the conversation Ollama can see, default 8192 (llama3's maximum). |
+| `OLLAMA_HOST`, `OLLAMA_MODEL` | Local fallback server and model. Default `http://127.0.0.1:11434` and `llama3`. |
+| `OLLAMA_NUM_CTX` | How many tokens of the conversation Ollama can see, default 8192 (llama3's maximum). Lower it if Ollama runs out of memory. |
+| `OLLAMA_TIMEOUT` | Seconds to wait for Ollama's reply, default 600. |
 | `DEFAULT_COOLDOWN_SECONDS` | First cooldown when a provider is out of usage and sends no `Retry-After`. |
 | `MAX_COOLDOWN_SECONDS` | Cap on the growing cooldown. |
 | `BACKOFF_MULTIPLIER` | How much the cooldown grows each time a provider is still out of usage. |
@@ -186,19 +226,23 @@ tunnel does this for you).
 - `GET /api/conversations`, `POST /api/conversations` (optionally with
   `imported_text` and `source` to continue a pasted chat),
   `GET`/`DELETE /api/conversations/<id>`, and
-  `POST /api/conversations/<id>/messages` with `{"content": "..."}`.
+  `POST /api/conversations/<id>/messages` with `{"content": "..."}` plus an
+  optional `"provider"`: `auto` (default), `openai`, `anthropic` or `ollama`.
 - `POST /v1/chat/completions`, `GET /v1/models` - OpenAI-compatible (above).
 - `POST /chat` with `{"message": "...", "history": [...]}` returns
   `{"reply", "provider", "handover"}`; `handover` is `true` when Ollama
-  answered. This is what the Second Life script uses.
-- `GET /status` - each provider's model, whether it's available or how long
-  until its cooldown ends, and which one answers next.
+  answered. It takes the same optional `"provider"`. This is what the Second
+  Life script uses.
+- `GET /status` - each provider's model, whether it's available (for Ollama,
+  whether it's reachable and has the model, with the problem if not) or how
+  long until its cooldown ends, and which one answers next.
 - `GET /health` - liveness check.
 
 The key goes in an `X-Bot-Secret` header, or `Authorization: Bearer <key>`
-for OpenAI-compatible clients. `503` means nothing could answer (the details
-go to the bot's log, not the response); `401` means the key is missing or
-wrong.
+for OpenAI-compatible clients. `503` means nothing could answer; its `detail`
+says why in plain words. Ollama's own reason is included, but ChatGPT/Claude
+error text stays in the bot's window because it can echo account details.
+`401` means the key is missing or wrong.
 
 ## Second Life (optional)
 

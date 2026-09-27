@@ -112,6 +112,8 @@ button:disabled { opacity: 0.55; cursor: default; }
 .pill.cooling { background: var(--warn-bg); }
 .pill.cooling::before { background: var(--warn); }
 .pill.local::before { background: var(--local); }
+.pill.down { border-color: var(--danger); }
+.pill.down::before { background: var(--danger); }
 .pill.active { border-color: var(--accent); font-weight: 600; }
 .status-note { font-size: 13px; color: var(--muted); margin-left: auto; }
 
@@ -174,6 +176,25 @@ button:disabled { opacity: 0.55; cursor: default; }
 .empty p { margin: 0 0 10px; }
 
 .composer { border-top: 1px solid var(--border); padding: 12px 20px 14px; background: var(--panel); }
+.composer-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: 900px;
+  margin: 0 auto 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.composer-options select {
+  font: inherit;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+.forced-note { color: var(--local); font-weight: 600; }
 .composer form { display: flex; gap: 10px; align-items: flex-end; max-width: 900px; margin: 0 auto; }
 .composer textarea {
   flex: 1;

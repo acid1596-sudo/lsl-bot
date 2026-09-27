@@ -12,8 +12,15 @@ logger = logging.getLogger("lslbot.router")
 
 
 class RouterError(Exception):
-    """Every primary provider is cooling down or failing, and the fallback
-    provider (Ollama) could not serve the request either."""
+    """No provider could serve the request. ``reason`` is "usage", "error" or
+    "fallback"; only ``fallback_error`` (Ollama's local message) is safe to
+    show a user, since cloud errors can echo account details."""
+
+    def __init__(self, message: str, reason: str, provider: str, fallback_error: str = ""):
+        super().__init__(message)
+        self.reason = reason
+        self.provider = provider
+        self.fallback_error = fallback_error
 
 
 @dataclass
@@ -73,7 +80,13 @@ class FailoverRouter:
         self._state: Dict[str, ProviderState] = {}
         self._load_state()
 
-    def generate(self, messages: List[Message]) -> RouterResult:
+    def provider_names(self) -> List[str]:
+        return [p.name for p in self._primary_providers] + [self._fallback.name]
+
+    def generate(self, messages: List[Message], only: Optional[str] = None) -> RouterResult:
+        if only is not None:
+            return self._generate_with(only, messages)
+
         # The lock guards provider state only; it is never held across a
         # provider call, so one slow reply can't stall every other request.
         attempts: List[str] = []
@@ -105,14 +118,45 @@ class FailoverRouter:
         except ProviderError as exc:
             attempts.append(f"{self._fallback.name}: error - {exc}")
             raise RouterError(
-                "every primary provider is unavailable and the fallback failed: "
-                + "; ".join(attempts)
+                "every primary provider is unavailable and the fallback failed: " + "; ".join(attempts),
+                reason="fallback",
+                provider=self._fallback.name,
+                fallback_error=str(exc),
             ) from exc
 
         attempts.append(f"{self._fallback.name}: ok")
         return RouterResult(text=text, provider=self._fallback.name, handover=True, attempts=attempts)
 
+    def _generate_with(self, name: str, messages: List[Message]) -> RouterResult:
+        # Exactly one provider, as chosen on the chat page - even one that's
+        # cooling down, since its usage may have reset early.
+        if name == self._fallback.name:
+            try:
+                text = self._fallback.generate(messages)
+            except ProviderError as exc:
+                raise RouterError(
+                    f"{name} failed: {exc}", reason="fallback", provider=name, fallback_error=str(exc)
+                ) from exc
+            return RouterResult(text=text, provider=name, handover=True, attempts=[f"{name}: ok"])
+
+        provider = next((p for p in self._primary_providers if p.name == name), None)
+        if provider is None:
+            raise ValueError(f"unknown provider {name!r}")
+        try:
+            text = provider.generate(messages)
+        except UsageExhaustedError as exc:
+            with self._lock:
+                self._on_exhausted(name, exc.retry_after)
+            raise RouterError(f"{name} is out of usage: {exc}", reason="usage", provider=name) from exc
+        except ProviderError as exc:
+            raise RouterError(f"{name} failed: {exc}", reason="error", provider=name) from exc
+        with self._lock:
+            self._on_success(name)
+        return RouterResult(text=text, provider=name, handover=False, attempts=[f"{name}: ok"])
+
     def status(self) -> dict:
+        # health() may make a network call, so it runs before taking the lock.
+        fallback_health = self._fallback.health()
         with self._lock:
             providers = {}
             for provider in self._primary_providers:
@@ -121,12 +165,14 @@ class FailoverRouter:
                     "role": "primary",
                     "model": getattr(provider, "model", None),
                     "available": remaining <= 0,
+                    "problem": None,
                     "retry_in_seconds": round(remaining, 1) if remaining > 0 else None,
                 }
             providers[self._fallback.name] = {
                 "role": "fallback",
                 "model": getattr(self._fallback, "model", None),
-                "available": True,
+                "available": bool(fallback_health.get("available")),
+                "problem": fallback_health.get("problem"),
                 "retry_in_seconds": None,
             }
 

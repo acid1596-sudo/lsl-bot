@@ -87,14 +87,42 @@ def _plain_messages(raw_messages) -> list:
     return messages
 
 
-def _generate(messages):
-    try:
-        return router.generate(messages)
-    except RouterError as exc:
-        # Provider errors can echo account details (e.g. a masked API key),
-        # so they go to the server log, not back to the caller.
-        logger.error("no provider could answer: %s", exc)
+_LABELS = {"openai": "ChatGPT", "anthropic": "Claude", "ollama": "Ollama"}
+
+
+class _BadProvider(ValueError):
+    pass
+
+
+def _chosen_provider(value):
+    """None means "auto": the usual failover chain."""
+    if value in (None, "", "auto"):
         return None
+    if value not in router.provider_names():
+        raise _BadProvider(f"unknown provider {value!r}; use auto or one of {router.provider_names()}")
+    return value
+
+
+def _explain(exc: RouterError, only) -> str:
+    # Only Ollama's own message is passed on: it's local, whereas cloud errors
+    # can echo account details (e.g. a masked API key) and stay in the log.
+    label = _LABELS.get(exc.provider, exc.provider)
+    if exc.reason == "usage":
+        return f"{label} is out of usage right now. Set 'Answer with' to Auto or another choice."
+    if exc.reason == "error":
+        return f"{label} couldn't answer; the reason is in the bot's window."
+    if only:
+        return f"Ollama couldn't answer. {exc.fallback_error}"
+    return f"ChatGPT/Claude couldn't be used, and Ollama couldn't answer either. {exc.fallback_error}"
+
+
+def _generate(messages, only=None):
+    """Returns (result, None) or (None, user-facing explanation)."""
+    try:
+        return router.generate(messages, only=only), None
+    except RouterError as exc:
+        logger.error("no provider could answer: %s", exc)
+        return None, _explain(exc, only)
 
 
 @app.get("/")
@@ -118,10 +146,16 @@ def chat():
     message = payload.get("message")
     if not isinstance(message, str) or not message:
         return jsonify({"error": "'message' is required"}), 400
+    try:
+        only = _chosen_provider(payload.get("provider"))
+    except _BadProvider as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    result = _generate(_plain_messages(payload.get("history")) + [{"role": "user", "content": message}])
+    result, problem = _generate(
+        _plain_messages(payload.get("history")) + [{"role": "user", "content": message}], only
+    )
     if result is None:
-        return jsonify({"error": NO_PROVIDER_ERROR}), 503
+        return jsonify({"error": NO_PROVIDER_ERROR, "detail": problem}), 503
     return jsonify({"reply": result.text, "provider": result.provider, "handover": result.handover})
 
 
@@ -164,10 +198,14 @@ def send_message(conversation_id):
     content = payload.get("content")
     if not isinstance(content, str) or not content.strip():
         return jsonify({"error": "'content' is required"}), 400
+    try:
+        only = _chosen_provider(payload.get("provider"))
+    except _BadProvider as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    result = _generate(store.history(conversation) + [{"role": "user", "content": content}])
+    result, problem = _generate(store.history(conversation) + [{"role": "user", "content": content}], only)
     if result is None:
-        return jsonify({"error": NO_PROVIDER_ERROR}), 503
+        return jsonify({"error": NO_PROVIDER_ERROR, "detail": problem}), 503
     updated = store.add_exchange(conversation_id, content, result.text, result.provider)
     if updated is None:
         return jsonify({"error": "conversation not found"}), 404
@@ -180,7 +218,16 @@ def _openai_error(message: str, status_code: int, error_type: str):
 
 @app.get("/v1/models")
 def openai_models():
-    return jsonify({"object": "list", "data": [{"id": "lslbot", "object": "model", "owned_by": "lslbot"}]})
+    # "lslbot" is the usual failover; "lslbot/<name>" uses only that provider.
+    ids = ["lslbot"] + [f"lslbot/{name}" for name in router.provider_names()]
+    return jsonify({"object": "list", "data": [{"id": i, "object": "model", "owned_by": "lslbot"} for i in ids]})
+
+
+def _provider_for_model(model):
+    if not isinstance(model, str):
+        return None
+    name = model[len("lslbot/"):] if model.startswith("lslbot/") else model
+    return name if name in router.provider_names() else None
 
 
 @app.post("/v1/chat/completions")
@@ -190,9 +237,9 @@ def openai_chat_completions():
     if not messages:
         return _openai_error("'messages' must contain at least one text message", 400, "invalid_request_error")
 
-    result = _generate(messages)
+    result, problem = _generate(messages, _provider_for_model(payload.get("model")))
     if result is None:
-        return _openai_error(NO_PROVIDER_ERROR, 503, "server_error")
+        return _openai_error(problem, 503, "server_error")
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())

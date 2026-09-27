@@ -5,20 +5,27 @@ import requests
 from .base import Message, Provider, ProviderError
 
 
+def _error_text(response) -> str:
+    try:
+        return str(response.json().get("error") or response.text)[:300]
+    except ValueError:
+        return response.text[:300] or f"HTTP {response.status_code}"
+
+
 class OllamaProvider(Provider):
     """Talks to a local Ollama server. This is the fallback: a local model has
     no usage cap to run out of, so it never raises UsageExhaustedError - only
-    ProviderError if the server can't be reached at all.
+    ProviderError, worded so the person at the chat page can act on it.
     """
 
     name = "ollama"
 
     def __init__(
         self,
-        host: str = "http://localhost:11434",
+        host: str = "http://127.0.0.1:11434",
         model: str = "llama3",
         num_ctx: int = 8192,
-        timeout: float = 300.0,
+        timeout: float = 600.0,
     ):
         self.host = host.rstrip("/")
         self.model = model
@@ -40,9 +47,36 @@ class OllamaProvider(Provider):
                 },
                 timeout=self.timeout,
             )
-            response.raise_for_status()
-            data = response.json()
+        except requests.ConnectTimeout as exc:
+            raise ProviderError(f"Ollama isn't reachable at {self.host}") from exc
+        except requests.ReadTimeout as exc:
+            raise ProviderError(
+                f"Ollama took longer than {self.timeout:.0f}s to answer (raise OLLAMA_TIMEOUT for a slow PC)"
+            ) from exc
+        except requests.ConnectionError as exc:
+            raise ProviderError(f"Ollama isn't reachable at {self.host}") from exc
         except requests.RequestException as exc:
             raise ProviderError(f"Ollama request failed: {exc}") from exc
 
+        if response.status_code >= 400:
+            raise ProviderError(f"Ollama said: {_error_text(response)}")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ProviderError(f"{self.host} answered, but not like Ollama does - is OLLAMA_HOST right?") from exc
         return data.get("message", {}).get("content", "")
+
+    def health(self) -> dict:
+        try:
+            response = requests.get(f"{self.host}/api/tags", timeout=3)
+            response.raise_for_status()
+            installed = {m.get("name") for m in response.json().get("models") or [] if isinstance(m, dict)}
+        except (requests.RequestException, ValueError, AttributeError):
+            return {"available": False, "problem": f"Ollama isn't reachable at {self.host}"}
+        wanted = self.model if ":" in self.model else f"{self.model}:latest"
+        if wanted not in installed:
+            return {
+                "available": False,
+                "problem": f"Ollama doesn't have the model '{self.model}' yet - run: ollama pull {self.model}",
+            }
+        return {"available": True, "problem": None}

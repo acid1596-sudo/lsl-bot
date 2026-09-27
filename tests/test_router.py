@@ -338,3 +338,70 @@ def test_simultaneous_usage_errors_log_one_handover(caplog):
     handovers = [r for r in caplog.records if "out of usage" in r.getMessage()]
     assert len(handovers) == 1
     assert router.status()["providers"]["openai"]["retry_in_seconds"] == pytest.approx(30.0)
+
+
+def test_only_fallback_skips_the_primaries():
+    primary = FakeProvider("openai", [])  # any call fails the test
+    router = make_router([primary], FakeProvider("ollama", ["local"]), FakeClock())
+    result = router.generate([], only="ollama")
+    assert (result.provider, result.text, result.handover) == ("ollama", "local", True)
+    assert primary.calls == 0
+
+
+def test_only_primary_skips_the_fallback_and_reports_why_it_failed():
+    clock = FakeClock()
+    router = make_router(
+        [FakeProvider("openai", [UsageExhaustedError("quota", retry_after=30), ProviderError("boom")])],
+        FakeProvider("ollama", []),
+        clock,
+    )
+    with pytest.raises(RouterError) as exhausted:
+        router.generate([], only="openai")
+    assert (exhausted.value.reason, exhausted.value.provider) == ("usage", "openai")
+    assert router.status()["providers"]["openai"]["retry_in_seconds"] == pytest.approx(30.0)
+
+    with pytest.raises(RouterError) as failed:
+        router.generate([], only="openai")
+    assert failed.value.reason == "error"
+
+
+def test_only_primary_is_tried_even_while_cooling_down_and_clears_it():
+    clock = FakeClock()
+    router = make_router(
+        [FakeProvider("openai", [UsageExhaustedError("quota", retry_after=600), "reset early"])],
+        FakeProvider("ollama", ["local"]),
+        clock,
+    )
+    router.generate([])  # -> exhausted, cooling for 600s
+    result = router.generate([], only="openai")
+    assert result.text == "reset early"
+    assert router.status()["providers"]["openai"]["available"] is True
+
+
+def test_only_unknown_provider_is_a_value_error():
+    router = make_router([FakeProvider("openai", [])], FakeProvider("ollama", []), FakeClock())
+    with pytest.raises(ValueError):
+        router.generate([], only="gemini")
+
+
+def test_fallback_failure_carries_ollamas_message():
+    router = make_router(
+        [FakeProvider("openai", [UsageExhaustedError("quota")])],
+        FakeProvider("ollama", [ProviderError("Ollama said: model 'llama3' not found")]),
+        FakeClock(),
+    )
+    with pytest.raises(RouterError) as exc_info:
+        router.generate([])
+    assert exc_info.value.reason == "fallback"
+    assert exc_info.value.fallback_error == "Ollama said: model 'llama3' not found"
+
+
+def test_status_reports_an_unhealthy_fallback():
+    class DownOllama(FakeProvider):
+        def health(self):
+            return {"available": False, "problem": "Ollama isn't reachable at http://127.0.0.1:11434"}
+
+    router = make_router([FakeProvider("openai", [])], DownOllama("ollama", []), FakeClock())
+    ollama = router.status()["providers"]["ollama"]
+    assert ollama["available"] is False
+    assert "isn't reachable" in ollama["problem"]

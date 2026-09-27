@@ -192,6 +192,8 @@ def test_anthropic_default_model_is_one_the_sdk_still_knows():
 
 def test_ollama_returns_reply_text(monkeypatch):
     class FakeResponse:
+        status_code = 200
+
         def raise_for_status(self):
             pass
 
@@ -234,6 +236,8 @@ def test_ollama_asks_for_a_context_window_big_enough_for_the_history(monkeypatch
     sent = {}
 
     class FakeResponse:
+        status_code = 200
+
         def raise_for_status(self):
             pass
 
@@ -247,3 +251,72 @@ def test_ollama_asks_for_a_context_window_big_enough_for_the_history(monkeypatch
     monkeypatch.setattr("lslbot.providers.ollama_provider.requests.post", fake_post)
     OllamaProvider(num_ctx=16384).generate([{"role": "user", "content": "hi"}])
     assert sent["options"] == {"num_ctx": 16384}
+
+
+class _Resp:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code}")
+
+
+def test_ollama_passes_on_its_own_error_message(monkeypatch):
+    monkeypatch.setattr(
+        "lslbot.providers.ollama_provider.requests.post",
+        lambda *a, **kw: _Resp(500, {"error": "model requires more system memory (5.6 GiB) than is available"}),
+    )
+    with pytest.raises(ProviderError) as exc_info:
+        OllamaProvider().generate([])
+    assert str(exc_info.value) == "Ollama said: model requires more system memory (5.6 GiB) than is available"
+
+
+def test_ollama_timeout_says_how_to_fix_it(monkeypatch):
+    def slow(*a, **kw):
+        raise requests.ReadTimeout("read timed out")
+
+    monkeypatch.setattr("lslbot.providers.ollama_provider.requests.post", slow)
+    with pytest.raises(ProviderError) as exc_info:
+        OllamaProvider(timeout=42).generate([])
+    assert "took longer than 42s" in str(exc_info.value) and "OLLAMA_TIMEOUT" in str(exc_info.value)
+
+
+def test_ollama_unreachable_names_the_address(monkeypatch):
+    def refused(*a, **kw):
+        raise requests.ConnectionError("refused")
+
+    monkeypatch.setattr("lslbot.providers.ollama_provider.requests.post", refused)
+    with pytest.raises(ProviderError) as exc_info:
+        OllamaProvider(host="http://127.0.0.1:11434").generate([])
+    assert str(exc_info.value) == "Ollama isn't reachable at http://127.0.0.1:11434"
+
+
+def test_ollama_health(monkeypatch):
+    target = "lslbot.providers.ollama_provider.requests.get"
+
+    monkeypatch.setattr(target, lambda *a, **kw: _Resp(200, {"models": [{"name": "llama3:latest"}]}))
+    assert OllamaProvider(model="llama3").health() == {"available": True, "problem": None}
+
+    monkeypatch.setattr(target, lambda *a, **kw: _Resp(200, {"models": [{"name": "mistral:latest"}]}))
+    missing = OllamaProvider(model="llama3").health()
+    assert missing["available"] is False and "ollama pull llama3" in missing["problem"]
+
+    def refused(*a, **kw):
+        raise requests.ConnectionError("refused")
+
+    monkeypatch.setattr(target, refused)
+    down = OllamaProvider().health()
+    assert down["available"] is False and "isn't reachable" in down["problem"]
+
+
+def test_ollama_defaults_to_the_ipv4_loopback():
+    # On Windows "localhost" can try IPv6 first and stall before falling back.
+    assert OllamaProvider().host == "http://127.0.0.1:11434"

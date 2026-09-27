@@ -35,6 +35,13 @@
 
       <div class="composer">
         <p class="error" id="send-error" role="alert" hidden></p>
+        <div class="composer-options">
+          <label for="answer-with">Answer with</label>
+          <select id="answer-with">
+            <option value="auto">Auto - switches to Ollama when usage runs out</option>
+          </select>
+          <span class="forced-note" id="forced-note" hidden></span>
+        </div>
         <form id="composer">
           <textarea id="input" rows="1" placeholder="Message ChatGPT or Claude..." aria-label="Message"></textarea>
           <button class="primary" id="send" type="submit">Send</button>

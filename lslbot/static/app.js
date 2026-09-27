@@ -2,9 +2,9 @@
 
 const LABELS = { openai: "ChatGPT", anthropic: "Claude", ollama: "Ollama" };
 const KEY_STORAGE = "lslbot-key";
-const NO_PROVIDER_ERROR = "no provider could answer right now";
+const ANSWER_WITH_STORAGE = "lslbot-answer-with";
 
-const state = { key: "", conversations: [], current: null, status: null, sending: false };
+const state = { key: "", conversations: [], current: null, status: null, sending: false, answerWith: "auto" };
 
 const $ = (id) => document.getElementById(id);
 
@@ -58,7 +58,8 @@ async function api(path, options = {}) {
   }
   if (response.status === 204) return null;
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
+  // "detail" is the server's plain-language explanation, when it has one.
+  if (!response.ok) throw new Error(body.detail || body.error || `Request failed (${response.status})`);
   return body;
 }
 
@@ -86,6 +87,11 @@ async function refreshStatus() {
     if (!(e instanceof Unauthorized)) state.status = null;
   }
   renderStatus();
+  renderAnswerWith();
+}
+
+function providerOrder(status) {
+  return status.order || Object.keys(status.providers);
 }
 
 function renderStatus() {
@@ -95,19 +101,26 @@ function renderStatus() {
 
   const status = state.status;
   if (!status) {
-    note.textContent = "Can't reach the bot. Is start.cmd still running?";
+    note.textContent = "Can't reach the bot. Is its window still open?";
     return;
   }
 
   const primaries = [];
-  for (const name of status.order || Object.keys(status.providers)) {
+  let fallback = null;
+  for (const name of providerOrder(status)) {
     const info = status.providers[name];
     const pill = document.createElement("span");
     pill.className = "pill";
     let text = providerLabel(name);
     if (info.role === "fallback") {
+      fallback = info;
       pill.classList.add("local");
-      text += " (local backup)";
+      if (info.available) {
+        text += " (local backup)";
+      } else {
+        pill.classList.add("down");
+        text += " unavailable";
+      }
     } else {
       primaries.push(providerLabel(name));
       if (!info.available) {
@@ -116,17 +129,70 @@ function renderStatus() {
       }
     }
     if (name === status.active_provider) pill.classList.add("active");
-    if (info.model) pill.title = info.model;
+    pill.title = info.problem || info.model || "";
     pill.textContent = text;
     bar.insertBefore(pill, note);
   }
 
   const active = status.providers[status.active_provider];
-  if (active && active.role === "fallback") {
-    const verb = primaries.length > 1 ? "are" : "is";
+  const backupDown = fallback && !fallback.available;
+  const verb = primaries.length > 1 ? "are" : "is";
+  if (active && active.role === "fallback" && backupDown) {
+    note.textContent = `${joinNames(primaries)} ${verb} out of usage and Ollama isn't available: ${fallback.problem}`;
+  } else if (active && active.role === "fallback") {
     note.textContent = `${joinNames(primaries)} ${verb} out of usage, so Ollama is answering. It hands back automatically.`;
+  } else if (backupDown) {
+    note.textContent = `${providerLabel(status.active_provider)} answers next. No backup right now: ${fallback.problem}`;
   } else {
     note.textContent = `${providerLabel(status.active_provider)} answers next; Ollama steps in if usage runs out.`;
+  }
+}
+
+// --- "Answer with": pulling a conversation to one provider -------------------
+
+function readAnswerWith() {
+  try {
+    return localStorage.getItem(ANSWER_WITH_STORAGE) || "auto";
+  } catch (e) {
+    return "auto";
+  }
+}
+
+function saveAnswerWith(value) {
+  state.answerWith = value;
+  try {
+    localStorage.setItem(ANSWER_WITH_STORAGE, value);
+  } catch (e) {
+    // Remembered for this tab only.
+  }
+}
+
+function renderAnswerWith() {
+  const select = $("answer-with");
+  if (state.status) {
+    const names = providerOrder(state.status);
+    const wanted = ["auto", ...names];
+    const current = Array.from(select.options).map((o) => o.value);
+    if (wanted.join() !== current.join()) {
+      while (select.options.length > 1) select.remove(1);
+      for (const name of names) {
+        const label = state.status.providers[name].role === "fallback" ? `${providerLabel(name)} (on this PC)` : providerLabel(name);
+        select.add(new Option(`${label} only`, name));
+      }
+    }
+    if (!wanted.includes(state.answerWith)) saveAnswerWith("auto");
+  }
+  select.value = state.answerWith;
+
+  const note = $("forced-note");
+  if (state.answerWith === "auto") {
+    note.hidden = true;
+  } else if (state.answerWith === "ollama") {
+    note.textContent = "Ollama is doing this task. Switch back to Auto to hand it back to ChatGPT/Claude.";
+    note.hidden = false;
+  } else {
+    note.textContent = `Only ${providerLabel(state.answerWith)} will answer until you switch back to Auto.`;
+    note.hidden = false;
   }
 }
 
@@ -314,6 +380,8 @@ function renderConversation() {
   messages.scrollTop = messages.scrollHeight;
 }
 
+let thinkingTimer = null;
+
 function showPending(text) {
   const messages = $("messages");
   messages.querySelectorAll(".empty").forEach((el) => el.remove());
@@ -326,6 +394,21 @@ function showPending(text) {
   thinking.append(bubble);
   messages.append(thinking);
   messages.scrollTop = messages.scrollHeight;
+
+  // A local model on a PC without a strong graphics card can take minutes,
+  // so show that it's still working rather than looking stuck.
+  const started = Date.now();
+  clearInterval(thinkingTimer);
+  thinkingTimer = setInterval(() => {
+    const seconds = Math.round((Date.now() - started) / 1000);
+    bubble.textContent =
+      seconds < 15 ? `Thinking... ${seconds}s` : `Thinking... ${seconds}s (a local model can take a few minutes on some PCs)`;
+  }, 1000);
+}
+
+function stopPending() {
+  clearInterval(thinkingTimer);
+  thinkingTimer = null;
 }
 
 // --- sending ----------------------------------------------------------------
@@ -351,21 +434,20 @@ async function send() {
     }
     const result = await api(`/api/conversations/${state.current.id}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content: text }),
+      body: JSON.stringify({ content: text, provider: state.answerWith }),
     });
+    stopPending();
     state.current = result.conversation;
     renderConversation();
     await loadConversations();
   } catch (e) {
+    stopPending();
     renderConversation();
     input.value = text;
     autosize();
     if (!(e instanceof Unauthorized)) {
-      showError(
-        e.message === NO_PROVIDER_ERROR
-          ? "Nothing could answer: ChatGPT and Claude are unavailable and Ollama isn't responding. Check that Ollama is running, then press Send again."
-          : e.message
-      );
+      const reason = /[.!?]$/.test(e.message) ? e.message : `${e.message}.`;
+      showError(`${reason} Your message is still in the box - press Send to try again.`);
     }
   } finally {
     setSending(false);
@@ -487,10 +569,15 @@ function wireUp() {
   $("copy-chat").addEventListener("click", copyChat);
   $("delete-chat").addEventListener("click", deleteCurrent);
   $("menu-toggle").addEventListener("click", () => $("app").classList.toggle("sidebar-open"));
+  $("answer-with").addEventListener("change", (event) => {
+    saveAnswerWith(event.target.value);
+    renderAnswerWith();
+  });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   state.key = readStoredKey();
+  state.answerWith = readAnswerWith();
   takeKeyFromUrl();
   wireUp();
   renderConversation();
